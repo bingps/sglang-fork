@@ -82,7 +82,8 @@ class RadixAttention(nn.Module):
         self.v_scale_float = None
         self.quant_method = None
 
-        if quant_config is not None:
+        from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+        if self.quant_method is not None and not isinstance(self.quant_method, UnquantizedLinearMethod):
             self.quant_method = quant_config.get_quant_method(self, prefix=prefix)
         if self.quant_method is not None:
             self.quant_method.create_weights(self)

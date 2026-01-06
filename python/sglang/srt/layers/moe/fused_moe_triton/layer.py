@@ -240,13 +240,15 @@ class FusedMoE(torch.nn.Module):
         server_args = get_global_server_args()
         kt_config = create_kt_config_from_server_args(server_args, layer_id)
         if kt_config is not None:
-            if quant_config is not None:
+            from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+            if quant_config is not None and not isinstance(self.quant_method, UnquantizedLinearMethod):
                 gpu_method = quant_config.get_quant_method(self, prefix)
             else:
                 gpu_method = UnquantizedFusedMoEMethod(self.use_triton_kernels)
             self.quant_method = KTEPWrapperMethod(gpu_method, kt_config)
         else:
-            if quant_config is not None:
+            from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+            if quant_config is not None and not isinstance(self.quant_method, UnquantizedLinearMethod):
                 self.quant_method = quant_config.get_quant_method(self, prefix)
             if self.quant_method is None:
                 self.quant_method = UnquantizedFusedMoEMethod(

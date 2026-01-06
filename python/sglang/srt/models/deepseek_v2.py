@@ -3840,11 +3840,13 @@ class DeepseekV2ForCausalLM(nn.Module):
                                     fused_weight = q_a_proj_weight
                                 else:
                                     cat_dim = 0
+                                    from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+                                    attn_quant_method = self.model.layers[layer_id].self_attn.attn_mqa.quant_method
                                     if self.quant_config is not None and (
                                         self.quant_config.get_name() == "awq"
                                         or self.quant_config.get_name() == "awq_marlin"
                                         or self.quant_config.get_name() == "moe_wna16"
-                                    ):
+                                    ) and attn_quant_method is not None:
                                         cat_dim = 1
 
                                     fused_weight = torch.cat(
