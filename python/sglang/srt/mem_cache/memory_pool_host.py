@@ -15,7 +15,12 @@ from sglang.jit_kernel.hicache import (
 from sglang.jit_kernel.hicache import (
     transfer_hicache_one_layer as jit_transfer_hicache_one_layer,
 )
-from sglang.srt.mem_cache.memory_pool import KVCache, MHATokenToKVPool, MLATokenToKVPool
+from sglang.srt.mem_cache.memory_pool import (
+    KVCache,
+    MHATokenToKVPool,
+    MLATokenToKVPool,
+    NSATokenToKVPool,
+)
 from sglang.srt.utils import is_cuda, is_npu, is_xpu
 
 _is_cuda = is_cuda()
@@ -1015,3 +1020,139 @@ class MLATokenToKVPoolHost(HostKVCache):
         else:
             raise ValueError(f"Unsupported layout: {self.layout}")
         return ptr_list, element_size_list
+
+
+class NSATokenToKVPoolHost(MLATokenToKVPoolHost):
+    device_pool: NSATokenToKVPool
+
+    def __init__(
+        self,
+        device_pool: NSATokenToKVPool,
+        host_to_device_ratio: float,
+        host_size: int,
+        page_size: int,
+        layout: str,
+        pin_memory: bool = True,
+        device: str = "cpu",
+        allocator_type: str = "default",
+    ):
+        self.index_head_dim = device_pool.index_head_dim
+        self.quant_block_size = device_pool.quant_block_size
+        self.index_dtype = device_pool.index_k_with_scale_buffer_dtype
+
+        super().__init__(
+            device_pool,
+            host_to_device_ratio,
+            host_size,
+            page_size,
+            layout,
+            pin_memory,
+            device,
+            allocator_type,
+        )
+
+    def _get_index_bytes_per_token(self) -> int:
+        return (
+            self.index_head_dim + self.index_head_dim // self.quant_block_size * 4
+        ) * self.index_dtype.itemsize
+
+    def get_size_per_token(self):
+        base = MLATokenToKVPoolHost.get_size_per_token(self)
+        return base + self._get_index_bytes_per_token() * self.layer_num
+
+    def init_kv_buffer(self):
+        kv_buffer = super().init_kv_buffer()
+        index_dim = self.page_size * (
+            self.index_head_dim + self.index_head_dim // self.quant_block_size * 4
+        )
+
+        if self.layout == "layer_first":
+            dims = (self.layer_num, self.page_num, index_dim)
+        else:
+            raise ValueError(f"Unsupported layout: {self.layout}")
+
+        alloc_func = ALLOC_MEMORY_FUNCS[self.device_pool.device]
+        self.index_k_buffer = alloc_func(
+            dims,
+            dtype=self.index_dtype,
+            device=self.device,
+            pin_memory=self.pin_memory,
+            allocator=self.allocator,
+        )
+        return kv_buffer
+
+    def _page_indices(self, indices: torch.Tensor) -> torch.Tensor:
+        """Convert token indices to page indices with alignment checks."""
+        if indices.numel() % self.page_size != 0:
+            raise ValueError(
+                f"Indices length {indices.numel()} must be a multiple of page_size {self.page_size}"
+            )
+
+        page_indices = torch.div(indices, self.page_size, rounding_mode="floor")
+        page_indices = page_indices.view(-1, self.page_size)
+
+        if not torch.all(page_indices == page_indices[:, :1]).item():
+            raise ValueError("Indices must be page-aligned for NSA index copy")
+
+        return page_indices[:, 0]
+
+    def _copy_index_to_host(
+        self,
+        device_pool: NSATokenToKVPool,
+        host_page_indices: torch.Tensor,
+        device_page_indices: torch.Tensor,
+    ) -> None:
+        if self.layout == "layer_first":
+            host_page_indices = host_page_indices.cpu()
+            host_buf = self.index_k_buffer
+            device_buf = device_pool.index_k_with_scale_buffer
+            for layer_id in range(self.layer_num):
+                host_buf[layer_id][host_page_indices].copy_(
+                    device_buf[layer_id][device_page_indices], non_blocking=True
+                )
+        else:
+            raise ValueError(f"Unsupported layout: {self.layout}")
+
+    def _copy_index_to_device(
+        self,
+        device_pool: NSATokenToKVPool,
+        host_page_indices: torch.Tensor,
+        device_page_indices: torch.Tensor,
+        layer_id: int,
+    ) -> None:
+        if self.layout == "layer_first":
+            host_page_indices = host_page_indices.cpu()
+            host_buf = self.index_k_buffer[layer_id]
+            device_buf = device_pool.index_k_with_scale_buffer[layer_id]
+            device_buf[device_page_indices].copy_(
+                host_buf[host_page_indices], non_blocking=True
+            )
+        else:
+            raise ValueError(f"Unsupported layout: {self.layout}")
+
+    def backup_from_device_all_layer(
+        self, device_pool, host_indices, device_indices, io_backend
+    ):
+        print(f"NSA backup {host_indices.shape=} {host_indices.device=}", flush=True)
+        super().backup_from_device_all_layer(
+            device_pool, host_indices, device_indices, io_backend
+        )
+        host_page_indices = self._page_indices(host_indices)
+        device_page_indices = self._page_indices(device_indices)
+        self._copy_index_to_host(device_pool, host_page_indices, device_page_indices)
+
+    def load_to_device_per_layer(
+        self, device_pool, host_indices, device_indices, layer_id, io_backend
+    ):
+        print(
+            f"NSA load back {layer_id=} {host_indices.shape=} {host_indices.device=}",
+            flush=True,
+        )
+        super().load_to_device_per_layer(
+            device_pool, host_indices, device_indices, layer_id, io_backend
+        )
+        host_page_indices = self._page_indices(host_indices)
+        device_page_indices = self._page_indices(device_indices)
+        self._copy_index_to_device(
+            device_pool, host_page_indices, device_page_indices, layer_id
+        )

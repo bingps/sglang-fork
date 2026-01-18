@@ -11,10 +11,15 @@ import torch
 
 from sglang.srt.managers.cache_controller import HiCacheController, PrefetchOperation
 from sglang.srt.mem_cache.base_prefix_cache import MatchResult
-from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, MLATokenToKVPool
+from sglang.srt.mem_cache.memory_pool import (
+    MHATokenToKVPool,
+    MLATokenToKVPool,
+    NSATokenToKVPool,
+)
 from sglang.srt.mem_cache.memory_pool_host import (
     MHATokenToKVPoolHost,
     MLATokenToKVPoolHost,
+    NSATokenToKVPoolHost,
 )
 from sglang.srt.mem_cache.radix_cache import (
     RadixCache,
@@ -30,6 +35,7 @@ if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
 
 
 class HiRadixCache(RadixCache):
@@ -54,6 +60,15 @@ class HiRadixCache(RadixCache):
                 server_args.hicache_mem_layout,
                 allocator_type=server_args.hicache_storage_backend,
             )
+        elif isinstance(self.kv_cache, NSATokenToKVPool):
+            self.token_to_kv_pool_host = NSATokenToKVPoolHost(
+                self.kv_cache,
+                server_args.hicache_ratio,
+                server_args.hicache_size,
+                self.page_size,
+                server_args.hicache_mem_layout,
+                allocator_type=server_args.hicache_storage_backend,
+            )
         elif isinstance(self.kv_cache, MLATokenToKVPool):
             self.token_to_kv_pool_host = MLATokenToKVPoolHost(
                 self.kv_cache,
@@ -64,7 +79,7 @@ class HiRadixCache(RadixCache):
                 allocator_type=server_args.hicache_storage_backend,
             )
         else:
-            raise ValueError(f"HiRadixCache only supports MHA and MLA yet")
+            raise ValueError("HiRadixCache supports only MHA/MLA/NSA caches")
 
         self.tp_group = params.tp_cache_group
         self.tp_world_size = torch.distributed.get_world_size(group=self.tp_group)
@@ -265,6 +280,10 @@ class HiRadixCache(RadixCache):
         if not node.backuped:
             if node.hit_count >= self.write_through_threshold:
                 # write to host if the node is not backuped
+                print(
+                    f"write through: node {len(node.key)=} with hit count {node.hit_count}",
+                    flush=True,
+                )
                 self.write_backup(node)
 
     def writing_check(self, write_back=False):
@@ -327,6 +346,7 @@ class HiRadixCache(RadixCache):
         return self.evictable_size_
 
     def evict(self, num_tokens: int):
+        print(f"to evict {num_tokens=}", flush=True)
         start_time = time.perf_counter()
         leaves = self._collect_leaves_device()
         eviction_heap = [
@@ -351,6 +371,7 @@ class HiRadixCache(RadixCache):
                     num_evicted += self._evict_regular(x)
             else:
                 num_evicted += self._evict_backuped(x)
+                print(f"evicted node {num_evicted=}", flush=True)
 
             for child in x.parent.children.values():
                 if child in write_back_nodes:
@@ -427,6 +448,7 @@ class HiRadixCache(RadixCache):
             assert (
                 node.backuped
             ), "No backup available on evicted nodes, should not happen"
+            print(f"loading back node {len(node.key)=}", flush=True)
             nodes_to_load.insert(0, node)
             node = node.parent
         else:
@@ -846,6 +868,7 @@ class HiRadixCache(RadixCache):
         chunked: bool = False,
         priority: int | None = None,
     ):
+        print(f"inserting key {len(key)=}", flush=True)
         if priority is None:
             priority = 0
         key, value = self.maybe_bigram_convert(key, value)
@@ -866,6 +889,9 @@ class HiRadixCache(RadixCache):
             node.last_access_time = time.monotonic()
             node.priority = max(node.priority, priority)
             prefix_len = self.key_match_fn(node.key, key)
+            print(
+                f"matched prefix len {prefix_len} for node {len(node.key)=}", flush=True
+            )
 
             if prefix_len == len(node.key):
                 if node.evicted:
