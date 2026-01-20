@@ -31,6 +31,7 @@ from sglang.srt.layers.attention.nsa.utils import (
 )
 from sglang.srt.layers.attention.trtllm_mla_backend import _concat_mla_absorb_q_general
 from sglang.srt.layers.dp_attention import get_attention_tp_size
+from sglang.srt.mem_cache.memory_pool import NSATokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.utils import is_cuda, is_hip
 
@@ -1260,6 +1261,12 @@ class NativeSparseAttnBackend(
                     page_size=1,
                 )
 
+        self._maybe_load_sparse_kv_from_host(
+            token_to_kv_pool=forward_batch.token_to_kv_pool,
+            layer_id=layer.layer_id,
+            page_table_1=page_table_1,
+        )
+
         if self.nsa_prefill_impl == "tilelang":
             if q_rope is not None:
                 q_all = _concat_mla_absorb_q_general(q_nope, q_rope)
@@ -1721,6 +1728,18 @@ class NativeSparseAttnBackend(
             device=topk_indices.device,
         )
         return torch.cat([topk_indices, padding], dim=0)
+
+    def _maybe_load_sparse_kv_from_host(
+        self,
+        token_to_kv_pool: NSATokenToKVPool,
+        layer_id: int,
+        page_table_1: torch.Tensor,
+    ) -> None:
+        host_pool = getattr(token_to_kv_pool, "token_to_kv_pool_host")
+        if not host_pool.hicache_prefill_sparse_cur_req:
+            return
+
+        host_pool.load_sparse_topk(layer_id, page_table_1)
 
     def get_cuda_graph_seq_len_fill_value(self):
         """Get the fill value for sequence length in CUDA graph."""

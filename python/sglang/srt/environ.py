@@ -247,6 +247,8 @@ class Envs:
 
     # Hi-Cache
     SGLANG_HICACHE_HF3FS_CONFIG_PATH = EnvStr(None)
+    SGLANG_HICACHE_PREFILL_SPARSE_ENABLE = EnvBool(False)
+    SGLANG_HICACHE_PREFILL_SPARSE_KV_LEN = EnvInt(10000)
 
     # Mooncake KV Transfer
     SGLANG_MOONCAKE_CUSTOM_MEM_POOL = EnvStr(None)
