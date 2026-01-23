@@ -774,6 +774,8 @@ class Req:
         self.dllm_block_offset = 0
         self.dllm_config = dllm_config
 
+        self.hicache_prefill_sparse_load = False
+
     @property
     def seqlen(self) -> int:
         """Get the current sequence length of the request."""
@@ -884,6 +886,7 @@ class Req:
                 match_result.host_hit_length,
                 match_result.mamba_branching_seqlen,
             )
+            print(f"{self.host_hit_length=}, {self.prefix_indices.shape=}", flush=True)
             self.cache_protected_len = len(self.prefix_indices)
 
         if (
@@ -2157,6 +2160,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             spec_algorithm=self.spec_algorithm,
             spec_info=self.spec_info,
             hicache_consumer_index=self.hicache_consumer_index,
+            hicache_prefill_sparse_load_reqs=[
+                req.hicache_prefill_sparse_load for req in self.reqs
+            ],
             capture_hidden_mode=(
                 CaptureHiddenMode.FULL
                 if self.return_hidden_states
@@ -2289,6 +2295,7 @@ class ModelWorkerBatch:
     # If set, the output of the batch contains the hidden states of the run.
     capture_hidden_mode: CaptureHiddenMode = None
     hicache_consumer_index: int = -1
+    hicache_prefill_sparse_load_reqs: Optional[List[bool]] = None
 
     # For matryoshka embeddings
     dimensions: Optional[list[int]] = None

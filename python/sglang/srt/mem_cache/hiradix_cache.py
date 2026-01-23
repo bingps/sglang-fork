@@ -9,7 +9,9 @@ from typing import TYPE_CHECKING, List, Optional
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.managers.cache_controller import HiCacheController, PrefetchOperation
+from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.mem_cache.base_prefix_cache import MatchResult
 from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKVPool,
@@ -449,7 +451,7 @@ class HiRadixCache(RadixCache):
             assert (
                 node.backuped
             ), "No backup available on evicted nodes, should not happen"
-            print(f"loading back node {len(node.key)=}", flush=True)
+            print(f"loading back node {len(node.key)=} ", flush=True)
             nodes_to_load.insert(0, node)
             node = node.parent
         else:
@@ -518,6 +520,19 @@ class HiRadixCache(RadixCache):
             torch.empty((0,), dtype=torch.int64, device=self.device),
             last_node,
         )
+
+    def label_sparse_load(self, req: Req):
+        extend_input_len = req.extend_input_len
+        host_hit_length = req.host_hit_length
+        last_host_node_id = req.last_host_node.id
+        is_sparse = (
+            envs.SGLANG_HICACHE_PREFILL_SPARSE_ENABLE.get()
+            and host_hit_length > envs.SGLANG_HICACHE_PREFILL_SPARSE_KV_LEN.get()
+            and extend_input_len < envs.SGLANG_HICACHE_PREFILL_SPARSE_INPUT_LEN.get()
+        )
+        req.hicache_prefill_sparse_load = is_sparse
+        print(f"{extend_input_len=}, {host_hit_length=}, {is_sparse=}", flush=True)
+        self.cache_controller.label_sparse_load(last_host_node_id, is_sparse)
 
     def ready_to_load_host_cache(self) -> int:
         """
@@ -869,7 +884,7 @@ class HiRadixCache(RadixCache):
         chunked: bool = False,
         priority: int | None = None,
     ):
-        print(f"inserting key {len(key)=}", flush=True)
+        print(f" inserting key {len(key)=}", flush=True)
         if priority is None:
             priority = 0
         key, value = self.maybe_bigram_convert(key, value)

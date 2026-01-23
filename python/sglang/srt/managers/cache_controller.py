@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING, List, NamedTuple, Optional
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageConfig,
     HiCacheStorageExtraInfo,
@@ -118,21 +119,49 @@ class CacheOperation:
         # default priority is the order of creation
         self.priority = priority if priority is not None else self.id
 
+        self.sparse_load = None
+
     @staticmethod
     def merge_ops(ops: List[CacheOperation]) -> CacheOperation:
         assert len(ops) > 0
         if len(ops) == 1:
-            return ops[0]
+            if ops[0].sparse_load:
+                return None, ops[0]
+            else:
+                return ops[0], None
 
-        host_indices = torch.cat([op.host_indices for op in ops])
-        device_indices = torch.cat([op.device_indices for op in ops])
+        host_indices = torch.cat([op.host_indices for op in ops if not op.sparse_load])
+        device_indices = torch.cat(
+            [op.device_indices for op in ops if not op.sparse_load]
+        )
+        sparse_host_indices = torch.cat(
+            [op.host_indices for op in ops if op.sparse_load]
+        )
+        sparse_device_indices = torch.cat(
+            [op.device_indices for op in ops if op.sparse_load]
+        )
+
         node_ids = []
-        priority = min(op.priority for op in ops)
+        sparse_node_ids = []
+        priority = min(op.priority for op in ops if not op.sparse_load)
+        sparse_priority = min(op.priority for op in ops if op.sparse_load)
         for op in ops:
-            node_ids.extend(op.node_ids)
-        merged_op = CacheOperation(host_indices, device_indices, -1, priority)
-        merged_op.node_ids = node_ids
-        return merged_op
+            if op.sparse_load:
+                sparse_node_ids.extend(op.node_ids)
+            else:
+                node_ids.extend(op.node_ids)
+
+        merged_op, sparse_merged_op = None, None
+        if len(node_ids) > 0:
+            merged_op = CacheOperation(host_indices, device_indices, -1, priority)
+            merged_op.node_ids = node_ids
+        if len(sparse_node_ids) > 0:
+            sparse_merged_op = CacheOperation(
+                sparse_host_indices, sparse_device_indices, -1, sparse_priority
+            )
+            sparse_merged_op.node_ids = sparse_node_ids
+
+        return merged_op, sparse_merged_op
 
     def __lt__(self, other: CacheOperation):
         return self.priority < other.priority
@@ -359,6 +388,9 @@ class HiCacheController:
 
         self.write_stream = device_module.Stream()
         self.load_stream = device_module.Stream()
+        if envs.SGLANG_HICACHE_PREFILL_SPARSE_ENABLE.get():
+            # low priority stream for background loading
+            self.load_stream_full = device_module.Stream(priority=9)
 
         if self.enable_storage:
             self.prefetch_thread = threading.Thread(
@@ -457,7 +489,8 @@ class HiCacheController:
         if len(self.write_queue) == 0:
             return
 
-        op = CacheOperation.merge_ops(self.write_queue)
+        op, sparse_op = CacheOperation.merge_ops(self.write_queue)
+        assert sparse_op is None, "there should be no sparse write operation"
         host_indices, device_indices = self.move_indices(op)
         self.write_queue.clear()
 
@@ -498,6 +531,23 @@ class HiCacheController:
         )
         return device_indices
 
+    def label_sparse_load(
+        self,
+        last_hit_node_id: int,
+        is_sparse: bool,
+    ) -> None:
+        # To process multiple requests with the same last node,
+        # and some requests need sparse loading while some don't.
+        # If sparse_load is None, it can be set to True or False.
+        # If sparse_load is True, it cannot be set to False.
+        for op in self.load_queue:
+            assert len(op.node_ids) == 1, "there should only be 1 node here"
+            if last_hit_node_id == op.node_ids[0]:
+                if op.sparse_load is None:
+                    op.sparse_load = is_sparse
+                elif is_sparse:
+                    op.sparse_load = True
+
     def move_indices(self, op: CacheOperation):
         host_indices, device_indices = op.host_indices, op.device_indices
         # move indices to GPU if using kernels, to host if using direct indexing
@@ -522,8 +572,17 @@ class HiCacheController:
             return -1
 
         producer_id = self.layer_done_counter.update_producer()
-        op = CacheOperation.merge_ops(self.load_queue)
-        host_indices, device_indices = self.move_indices(op)
+        op, sparse_op = CacheOperation.merge_ops(self.load_queue)
+        host_indices, device_indices, sparse_host_indices, sparse_device_indices = (
+            None,
+            None,
+            None,
+            None,
+        )
+        if op is not None:
+            host_indices, device_indices = self.move_indices(op)
+        if sparse_op is not None:
+            sparse_host_indices, sparse_device_indices = self.move_indices(sparse_op)
         self.load_queue.clear()
         producer_event = self.layer_done_counter.events[producer_id]
         producer_event.start_event.record()
@@ -531,29 +590,71 @@ class HiCacheController:
         with device_module.stream(self.load_stream):
             producer_event.start_event.wait(self.load_stream)
             for i in range(self.layer_num):
-                self.mem_pool_host.load_to_device_per_layer(
-                    self.mem_pool_device,
-                    host_indices,
-                    device_indices,
-                    i,
-                    self.io_backend,
-                )
+                if host_indices is not None:
+                    self.mem_pool_host.load_to_device_per_layer(
+                        self.mem_pool_device,
+                        host_indices,
+                        device_indices,
+                        i,
+                        self.io_backend,
+                    )
+                    self.mem_pool_host.load_index_to_device_per_layer(
+                        self.mem_pool_device,
+                        host_indices,
+                        device_indices,
+                        i,
+                        self.io_backend,
+                    )
+                if sparse_host_indices is not None:
+                    self.mem_pool_host.load_index_to_device_per_layer(
+                        self.mem_pool_device,
+                        sparse_host_indices,
+                        sparse_device_indices,
+                        i,
+                        self.io_backend,
+                    )
                 producer_event.complete(i)
             # NOTE: We must save the host indices and device indices here,
             # this is because we need to guarantee that these tensors are
             # still alive when the load stream is executing.
-            if host_indices.is_cuda:
-                host_indices.record_stream(self.load_stream)
-            if device_indices.is_cuda:
-                device_indices.record_stream(self.load_stream)
+            if host_indices is not None:
+                if host_indices.is_cuda:
+                    host_indices.record_stream(self.load_stream)
+                if device_indices.is_cuda:
+                    device_indices.record_stream(self.load_stream)
+            if sparse_host_indices is not None:
+                if sparse_host_indices.is_cuda:
+                    sparse_host_indices.record_stream(self.load_stream)
+                if sparse_device_indices.is_cuda:
+                    sparse_device_indices.record_stream(self.load_stream)
 
-        self.ack_load_queue.append(
-            HiCacheAck(
-                start_event=producer_event.start_event,
-                finish_event=producer_event.finish_event,
-                node_ids=op.node_ids,
+        if sparse_host_indices is not None:
+            with device_module.stream(self.load_stream_full):
+                for i in range(self.layer_num):
+                    self.mem_pool_host.load_to_device_per_layer(
+                        self.mem_pool_device,
+                        sparse_host_indices,
+                        sparse_device_indices,
+                        i,
+                        self.io_backend,
+                    )
+
+        if op is not None:
+            self.ack_load_queue.append(
+                HiCacheAck(
+                    start_event=producer_event.start_event,
+                    finish_event=producer_event.finish_event,
+                    node_ids=op.node_ids,
+                )
             )
-        )
+        if sparse_op is not None:
+            self.ack_load_queue.append(
+                HiCacheAck(
+                    start_event=producer_event.start_event,
+                    finish_event=producer_event.finish_event,
+                    node_ids=sparse_op.node_ids,
+                )
+            )
         return producer_id
 
     def evict_device(self, device_indices: torch.Tensor) -> int:

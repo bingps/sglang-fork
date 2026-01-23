@@ -134,6 +134,8 @@ class NSAMetadata:
     # batch index for each token.
     token_to_batch_idx: Optional[torch.Tensor] = None
 
+    hicache_prefill_sparse_load_slices: Optional[torch.Tensor] = None
+
 
 class TopkTransformMethod(IntEnum):
     # Transform topk indices to indices to the page table (page_size = 1)
@@ -608,6 +610,28 @@ class NativeSparseAttnBackend(
             except (ImportError, ModuleNotFoundError):
                 paged_mqa_schedule_metadata = None
 
+        hicache_prefill_sparse_load_slices = None
+        if forward_batch.hicache_prefill_sparse_load_reqs is not None and any(
+            forward_batch.hicache_prefill_sparse_load_reqs
+        ):
+            hicache_prefill_sparse_load_slices = []
+            for i, is_sparse in enumerate(
+                forward_batch.hicache_prefill_sparse_load_reqs
+            ):
+                if is_sparse:
+                    hicache_prefill_sparse_load_slices.append(
+                        torch.arange(
+                            cu_seqlens_q[i], cu_seqlens_q[i + 1], device=device
+                        )
+                    )
+            hicache_prefill_sparse_load_slices = torch.cat(
+                hicache_prefill_sparse_load_slices, dim=0
+            )
+            print(
+                f"{forward_batch.hicache_prefill_sparse_load_reqs=} {cu_seqlens_q=} {hicache_prefill_sparse_load_slices=}",
+                flush=True,
+            )
+
         metadata = NSAMetadata(
             page_size=self.real_page_size,
             cache_seqlens_int32=cache_seqlens_int32,
@@ -638,6 +662,7 @@ class NativeSparseAttnBackend(
             indexer_k_start_end=indexer_k_start_end,
             indexer_seq_lens_cpu=indexer_seq_lens_cpu,
             token_to_batch_idx=token_to_batch_idx,
+            hicache_prefill_sparse_load_slices=hicache_prefill_sparse_load_slices,
         )
         self.forward_metadata = metadata
 
@@ -1180,6 +1205,8 @@ class NativeSparseAttnBackend(
         k_rope: Optional[torch.Tensor] = None,
         topk_indices: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        if layer.layer_id == 0:
+            print(f"{q.shape=} {k.shape=} {forward_batch.seq_lens=}", flush=True)
 
         if k is not None:
             assert v is not None
@@ -1261,7 +1288,11 @@ class NativeSparseAttnBackend(
                     page_size=1,
                 )
 
+        if layer.layer_id == 0 and topk_indices is not None:
+            print(f"{topk_indices.shape=} {page_table_1.max()=}", flush=True)
+
         self._maybe_load_sparse_kv_from_host(
+            hicache_prefill_sparse_load_slices=metadata.hicache_prefill_sparse_load_slices,
             token_to_kv_pool=forward_batch.token_to_kv_pool,
             layer_id=layer.layer_id,
             page_table_1=page_table_1,
@@ -1731,15 +1762,21 @@ class NativeSparseAttnBackend(
 
     def _maybe_load_sparse_kv_from_host(
         self,
+        hicache_prefill_sparse_load_slices: Optional[torch.Tensor],
         token_to_kv_pool: NSATokenToKVPool,
         layer_id: int,
         page_table_1: torch.Tensor,
     ) -> None:
-        host_pool = getattr(token_to_kv_pool, "token_to_kv_pool_host")
-        if not host_pool.hicache_prefill_sparse_cur_req:
-            return
-
-        host_pool.load_sparse_topk(layer_id, page_table_1)
+        if hicache_prefill_sparse_load_slices is not None:
+            host_pool = getattr(token_to_kv_pool, "token_to_kv_pool_host")
+            sparse_load_device_indices = page_table_1[
+                hicache_prefill_sparse_load_slices
+            ]
+            print(
+                f"{layer_id=} {hicache_prefill_sparse_load_slices=} {sparse_load_device_indices.shape=}",
+                flush=True,
+            )
+            host_pool.load_sparse_topk(layer_id, sparse_load_device_indices)
 
     def get_cuda_graph_seq_len_fill_value(self):
         """Get the fill value for sequence length in CUDA graph."""

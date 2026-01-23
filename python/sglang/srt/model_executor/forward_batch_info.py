@@ -400,6 +400,8 @@ class ForwardBatch:
     # For hidden states before normal
     return_hidden_states_before_norm: bool = False
 
+    hicache_prefill_sparse_load_reqs: Optional[List[bool]] = None
+
     @classmethod
     def init_new(
         cls,
@@ -444,6 +446,7 @@ class ForwardBatch:
             tbo_split_seq_index=batch.tbo_split_seq_index,
             dimensions=batch.dimensions,
             return_hidden_states_before_norm=batch.return_hidden_states_before_norm,
+            hicache_prefill_sparse_load_reqs=batch.hicache_prefill_sparse_load_reqs,
         )
         device = model_runner.device
 

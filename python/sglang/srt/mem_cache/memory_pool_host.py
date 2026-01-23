@@ -210,6 +210,15 @@ class HostKVCache(abc.ABC):
         raise NotImplementedError()
 
     @abc.abstractmethod
+    def load_index_to_device_per_layer(
+        self, device_pool, host_indices, device_indices, layer_id, io_backend
+    ) -> None:
+        """
+        Load index data for NSA from the host memory pool to the device memory pool for a specific layer.
+        """
+        raise NotImplementedError()
+
+    @abc.abstractmethod
     def backup_from_device_all_layer(
         self, device_pool, host_indices, device_indices, io_backend
     ) -> None:
@@ -1054,10 +1063,6 @@ class NSATokenToKVPoolHost(MLATokenToKVPoolHost):
         self.hicache_prefill_sparse_enable = (
             envs.SGLANG_HICACHE_PREFILL_SPARSE_ENABLE.get()
         )
-        self.hicache_prefill_sparse_kv_len = (
-            envs.SGLANG_HICACHE_PREFILL_SPARSE_KV_LEN.get()
-        )
-        self.hicache_prefill_sparse_cur_req = False
         if self.hicache_prefill_sparse_enable:
             self.device_to_host_indices = torch.full(
                 (self.device_pool.size,),
@@ -1159,24 +1164,31 @@ class NSATokenToKVPoolHost(MLATokenToKVPoolHost):
     def load_to_device_per_layer(
         self, device_pool, host_indices, device_indices, layer_id, io_backend
     ):
-        if layer_id == self.start_layer:
-            if (
-                not self.hicache_prefill_sparse_enable
-                or device_indices.numel() < self.hicache_prefill_sparse_kv_len
-            ):
-                self.hicache_prefill_sparse_cur_req = False
-            else:
-                self.hicache_prefill_sparse_cur_req = True
-                # update device_to_host_indices for prefill sparse
-                self.device_to_host_indices.fill_(
-                    torch.iinfo(torch.int32).max
-                )  # reset for current batch
-                self.device_to_host_indices[device_indices] = host_indices
+        print(
+            f"NSA load back {layer_id=} {host_indices.shape=} {host_indices.device=} ",
+            flush=True,
+        )
+        super().load_to_device_per_layer(
+            device_pool, host_indices, device_indices, layer_id, io_backend
+        )
 
-        if not self.hicache_prefill_sparse_cur_req:
-            super().load_to_device_per_layer(
-                device_pool, host_indices, device_indices, layer_id, io_backend
+    def load_index_to_device_per_layer(
+        self, device_pool, host_indices, device_indices, layer_id, io_backend
+    ):
+        print(
+            f"NSA load back index {layer_id=} {host_indices.shape=} {host_indices.device=} ",
+            flush=True,
+        )
+        if layer_id == self.start_layer:
+            # update device_to_host_indices for load_sparse_topk during nsa
+            self.device_to_host_indices.fill_(
+                torch.iinfo(torch.int32).max
+            )  # reset for current batch
+            print(
+                f"update device_to_host_indices {layer_id=} {host_indices=} {device_indices=}",
+                flush=True,
             )
+            self.device_to_host_indices[device_indices] = host_indices
 
         host_page_indices = self._page_indices(host_indices)
         device_page_indices = self._page_indices(device_indices)
@@ -1195,9 +1207,18 @@ class NSATokenToKVPoolHost(MLATokenToKVPoolHost):
         device_indices = torch.unique(device_indices)
         host_indices = self.device_to_host_indices[device_indices]
         device_indices = device_indices.to(torch.long)
+        # print(
+        #     f"load sparse unique {layer_id=} {device_indices.shape=} {host_indices.shape=} {device_indices=} {host_indices=}",
+        #     flush=True,
+        # )
 
         device_indices = device_indices[host_indices != torch.iinfo(torch.int32).max]
         host_indices = host_indices[host_indices != torch.iinfo(torch.int32).max]
+
+        print(
+            f"load sparse {layer_id=} {device_indices.shape=} {host_indices.shape=}",
+            flush=True,
+        )
 
         if host_indices.numel() == 0:
             return
