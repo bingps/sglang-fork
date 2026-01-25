@@ -1065,7 +1065,7 @@ class NSATokenToKVPoolHost(MLATokenToKVPoolHost):
         )
         if self.hicache_prefill_sparse_enable:
             self.device_to_host_indices = torch.full(
-                (self.device_pool.size,),
+                (self.device_pool.size + self.page_size,),
                 torch.iinfo(torch.int32).max,
                 dtype=torch.long,
                 device=self.device_pool.device,
