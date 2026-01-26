@@ -635,10 +635,6 @@ class NativeSparseAttnBackend(
             hicache_prefill_sparse_load_slices = torch.cat(
                 hicache_prefill_sparse_load_slices, dim=0
             )
-            print(
-                f"{forward_batch.hicache_prefill_sparse_load_reqs=} {cu_seqlens_q=} {hicache_prefill_sparse_load_slices=}",
-                flush=True,
-            )
 
         metadata = NSAMetadata(
             page_size=self.real_page_size,
@@ -1296,9 +1292,6 @@ class NativeSparseAttnBackend(
                     page_size=1,
                 )
 
-        if layer.layer_id == 0 and topk_indices is not None:
-            print(f"{topk_indices.shape=} {page_table_1.max()=}", flush=True)
-
         self._maybe_load_sparse_kv_from_host(
             hicache_prefill_sparse_load_slices=metadata.hicache_prefill_sparse_load_slices,
             token_to_kv_pool=forward_batch.token_to_kv_pool,
@@ -1852,10 +1845,6 @@ class NativeSparseAttnBackend(
             sparse_load_device_indices = page_table_1[
                 hicache_prefill_sparse_load_slices
             ]
-            print(
-                f"{layer_id=} {hicache_prefill_sparse_load_slices=} {sparse_load_device_indices.shape=}",
-                flush=True,
-            )
             host_pool.load_sparse_topk(layer_id, sparse_load_device_indices)
 
     def get_cuda_graph_seq_len_fill_value(self):

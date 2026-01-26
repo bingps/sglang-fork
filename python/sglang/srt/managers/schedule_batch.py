@@ -889,7 +889,6 @@ class Req:
                 match_result.host_hit_length,
                 match_result.mamba_branching_seqlen,
             )
-            print(f"{self.host_hit_length=}, {self.prefix_indices.shape=}", flush=True)
             self.cache_protected_len = len(self.prefix_indices)
 
         if (

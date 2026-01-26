@@ -1153,7 +1153,6 @@ class NSATokenToKVPoolHost(MLATokenToKVPoolHost):
     def backup_from_device_all_layer(
         self, device_pool, host_indices, device_indices, io_backend
     ):
-        print(f"NSA backup {host_indices.shape=} {host_indices.device=}", flush=True)
         super().backup_from_device_all_layer(
             device_pool, host_indices, device_indices, io_backend
         )
@@ -1164,10 +1163,6 @@ class NSATokenToKVPoolHost(MLATokenToKVPoolHost):
     def load_to_device_per_layer(
         self, device_pool, host_indices, device_indices, layer_id, io_backend
     ):
-        print(
-            f"NSA load back {layer_id=} {host_indices.shape=} {host_indices.device=} ",
-            flush=True,
-        )
         super().load_to_device_per_layer(
             device_pool, host_indices, device_indices, layer_id, io_backend
         )
@@ -1184,10 +1179,6 @@ class NSATokenToKVPoolHost(MLATokenToKVPoolHost):
             self.device_to_host_indices.fill_(
                 torch.iinfo(torch.int32).max
             )  # reset for current batch
-            print(
-                f"update device_to_host_indices {layer_id=} {host_indices=} {device_indices=}",
-                flush=True,
-            )
             self.device_to_host_indices[device_indices] = host_indices
 
         host_page_indices = self._page_indices(host_indices)
@@ -1207,10 +1198,6 @@ class NSATokenToKVPoolHost(MLATokenToKVPoolHost):
         device_indices = torch.unique(device_indices)
         host_indices = self.device_to_host_indices[device_indices]
         device_indices = device_indices.to(torch.long)
-        # print(
-        #     f"load sparse unique {layer_id=} {device_indices.shape=} {host_indices.shape=} {device_indices=} {host_indices=}",
-        #     flush=True,
-        # )
 
         device_indices = device_indices[host_indices != torch.iinfo(torch.int32).max]
         host_indices = host_indices[host_indices != torch.iinfo(torch.int32).max]

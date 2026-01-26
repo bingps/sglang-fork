@@ -735,10 +735,6 @@ class PrefillAdder:
                 prefix_len = len(req.prefix_indices)
                 req.cache_protected_len = prefix_len
                 self.tree_cache.label_sparse_load(req)
-            print(
-                f"{req.extend_input_len=}, {prefix_len=}, {req.host_hit_length=}",
-                flush=True,
-            )
 
             input_tokens = self.ceil_paged_tokens(req.extend_input_len)
 

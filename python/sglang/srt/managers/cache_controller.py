@@ -638,6 +638,7 @@ class HiCacheController:
                         i,
                         self.io_backend,
                     )
+                # todo: wait the full load to complete
 
         if op is not None:
             self.ack_load_queue.append(

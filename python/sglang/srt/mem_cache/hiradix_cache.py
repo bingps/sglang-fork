@@ -317,10 +317,6 @@ class HiRadixCache(RadixCache):
         if not node.backuped:
             if node.hit_count >= self.write_through_threshold:
                 # write to host if the node is not backuped
-                print(
-                    f"write through: node {len(node.key)=} with hit count {node.hit_count}",
-                    flush=True,
-                )
                 self.write_backup(node)
 
     def writing_check(self, write_back=False):
@@ -410,7 +406,6 @@ class HiRadixCache(RadixCache):
                     num_evicted += self._evict_regular(x)
             else:
                 num_evicted += self._evict_backuped(x)
-                print(f"evicted node {num_evicted=}", flush=True)
 
             for child in x.parent.children.values():
                 if child in write_back_nodes:
@@ -488,7 +483,6 @@ class HiRadixCache(RadixCache):
             assert (
                 node.backuped
             ), "No backup available on evicted nodes, should not happen"
-            print(f"loading back node {len(node.key)=} ", flush=True)
             nodes_to_load.insert(0, node)
             node = node.parent
         else:
@@ -568,7 +562,6 @@ class HiRadixCache(RadixCache):
             and extend_input_len < envs.SGLANG_HICACHE_PREFILL_SPARSE_INPUT_LEN.get()
         )
         req.hicache_prefill_sparse_load = is_sparse
-        print(f"{extend_input_len=}, {host_hit_length=}, {is_sparse=}", flush=True)
         self.cache_controller.label_sparse_load(last_host_node_id, is_sparse)
 
     def ready_to_load_host_cache(self) -> int:
@@ -950,9 +943,6 @@ class HiRadixCache(RadixCache):
             node.last_access_time = time.monotonic()
             node.priority = max(node.priority, priority)
             prefix_len = self.key_match_fn(node.key, key)
-            print(
-                f"matched prefix len {prefix_len} for node {len(node.key)=}", flush=True
-            )
 
             if prefix_len == len(node.key):
                 if node.evicted:
