@@ -21,6 +21,8 @@ class ContextWorkloadGenerator(WorkloadGenerator):
         self.baseurl = f"http://{args.host}:{args.port}/"
         self.url = self.baseurl + "generate"
 
+        self.dataset_format = args.dataset_format
+
         self.tokenizer = get_tokenizer(args.model_path)
         self.distribution = args.distribution
         self.request_rate = args.request_rate
@@ -30,30 +32,20 @@ class ContextWorkloadGenerator(WorkloadGenerator):
         self.sent_requests = 0
         self.completed_requests = 0
 
-        self.dataset = json.load(open(args.dataset_path))
-        num_requests = min(args.num_clients, len(self.dataset["queries"]))
+        if self.dataset_format == "loopserve":
+            init_requests = self._build_loopserve_requests(args)
+            queue_policy = "fifo"
+        else:
+            init_requests = self._build_requests_from_json(args)
+            queue_policy = args.ready_queue_policy
 
-        init_requests = []
-        for i in range(num_requests):
-            context_id = self.dataset["queries"][i]["context"]
-            init_requests.append(
-                (
-                    i,
-                    gen_payload(
-                        self.dataset["contexts"][context_id]
-                        + self.dataset["queries"][i]["question"],
-                        len(
-                            self.tokenizer(
-                                self.dataset["queries"][i]["reference_answer"]
-                            )["input_ids"]
-                        ),
-                    ),
-                )
-            )
-        self.ready_queue = ReadyQueue(init_requests=init_requests)
+        if not init_requests:
+            raise ValueError("No requests prepared for benchmarking")
+
+        self.ready_queue = ReadyQueue(init_requests=init_requests, policy=queue_policy)
 
         self.response_queue = queue.Queue()
-        self.pbar = tqdm(total=num_requests)
+        self.pbar = tqdm(total=len(init_requests))
         self.performance_metrics = {
             "ttft": [],
             "latency": [],
@@ -66,6 +58,70 @@ class ContextWorkloadGenerator(WorkloadGenerator):
         self.max_parallel = args.max_parallel
         self.logfile = args.log_file
         self.enable_round_barrier = False
+
+    def _build_requests_from_json(self, args):
+        with open(args.dataset_path) as f:
+            dataset = json.load(f)
+
+        num_requests = min(args.num_clients, len(dataset["queries"]))
+        init_requests = []
+        for i in range(num_requests):
+            context_id = dataset["queries"][i]["context"]
+            prompt = dataset["contexts"][context_id] + dataset["queries"][i]["question"]
+            answer_len = len(
+                self.tokenizer(dataset["queries"][i]["reference_answer"])["input_ids"]
+            )
+            init_requests.append((i, gen_payload(prompt, answer_len, args.lora_path)))
+        return init_requests
+
+    def _build_loopserve_requests(self, args):
+        from datasets import load_dataset
+
+        dataset = load_dataset(
+            "TreeAILab/Multi-turn_Long-context_Benchmark_for_LLMs",
+            "multi-turn_QA",
+            split="train",
+        )
+
+        num_conversations = min(args.num_clients, len(dataset))
+        init_requests = []
+        request_id = 0
+        for _ in range(args.num_rounds):
+            for idx in range(num_conversations):
+                all_prompt = ""
+                for ti, turn in enumerate(dataset[idx]["multi_turn"]):
+                    prompt = turn["prompt_back"]
+                    question = turn["question_at_back"]
+                    assert question in prompt
+                    prompt_no_question = prompt.replace(question, "", 1)
+                    assert prompt_no_question == prompt[: -len(question)]
+
+                    init_requests.append(
+                        (
+                            request_id,
+                            gen_payload(
+                                all_prompt + prompt_no_question,
+                                args.output_length,
+                                args.lora_path,
+                            ),
+                        )
+                    )
+                    request_id += 1
+
+                    init_requests.append(
+                        (
+                            request_id,
+                            gen_payload(
+                                all_prompt + prompt,
+                                args.output_length,
+                                args.lora_path,
+                            ),
+                        )
+                    )
+                    request_id += 1
+                    all_prompt += prompt
+
+        return init_requests
 
     def response_handler(self):
         while True:
@@ -90,11 +146,17 @@ class ContextWorkloadGenerator(WorkloadGenerator):
 
 if __name__ == "__main__":
     args = parse_args()
-    args.num_rounds = 1
     args.max_parallel = 24
     flush_cache_url = f"http://{args.host}:{args.port}/flush_cache"
 
-    for request_rate in [24, 16, 12, 8, 4, 2, 1]:
+    if args.disable_auto_run:
+        print("Running with specified request rate...")
+        request_rates = [args.request_rate]
+    else:
+        print("Auto-running with different request rates...")
+        request_rates = [24, 16, 12, 8, 4, 2, 1]
+
+    for request_rate in request_rates:
         args.request_rate = request_rate
         requests.post(flush_cache_url)
         time.sleep(1)

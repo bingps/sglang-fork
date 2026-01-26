@@ -95,6 +95,13 @@ def parse_args():
         help="local dataset to sample tokens from",
     )
     parser.add_argument(
+        "--dataset-format",
+        type=str,
+        default="longqa_json",
+        choices=["longqa_json", "loopserve"],
+        help="Dataset format for long-context benchmarks (json with contexts/queries or the loopserve HF set)",
+    )
+    parser.add_argument(
         "--log-file",
         type=str,
         default="performance_metrics.jsonl",
