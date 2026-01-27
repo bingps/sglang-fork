@@ -47,6 +47,7 @@ if _is_npu:
     from sgl_kernel_npu.kvcacheio import TransferDirection, transfer_kv_dim_exchange
 
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
 
 
 def synchronized(func):
@@ -1170,16 +1171,13 @@ class NSATokenToKVPoolHost(MLATokenToKVPoolHost):
     def load_index_to_device_per_layer(
         self, device_pool, host_indices, device_indices, layer_id, io_backend
     ):
-        print(
-            f"NSA load back index {layer_id=} {host_indices.shape=} {host_indices.device=} ",
-            flush=True,
-        )
         host_page_indices = self._page_indices(host_indices)
         device_page_indices = self._page_indices(device_indices)
         self._copy_index_to_device(
             device_pool, host_page_indices, device_page_indices, layer_id
         )
         if self.hicache_prefill_sparse_enable and layer_id == self.start_layer:
+            logger.debug(f"NSA load_index_to_device_per_layer: {host_indices.shape=}")
             # update device_to_host_indices for load_sparse_topk during nsa
             self.device_to_host_indices.fill_(
                 torch.iinfo(torch.int32).max
@@ -1201,10 +1199,7 @@ class NSATokenToKVPoolHost(MLATokenToKVPoolHost):
         device_indices = device_indices[host_indices != torch.iinfo(torch.int32).max]
         host_indices = host_indices[host_indices != torch.iinfo(torch.int32).max]
 
-        print(
-            f"load sparse {layer_id=} {device_indices.shape=} {host_indices.shape=}",
-            flush=True,
-        )
+        logger.debug(f"NSA load_sparse_topk: {layer_id=} {device_indices.shape=}")
 
         if host_indices.numel() == 0:
             return

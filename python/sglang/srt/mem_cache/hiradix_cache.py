@@ -553,16 +553,21 @@ class HiRadixCache(RadixCache):
         )
 
     def label_sparse_load(self, req: Req):
-        extend_input_len = req.extend_input_len
-        host_hit_length = req.host_hit_length
-        last_host_node_id = req.last_host_node.id
-        is_sparse = (
-            envs.SGLANG_HICACHE_PREFILL_SPARSE_ENABLE.get()
-            and host_hit_length > envs.SGLANG_HICACHE_PREFILL_SPARSE_KV_LEN.get()
-            and extend_input_len < envs.SGLANG_HICACHE_PREFILL_SPARSE_INPUT_LEN.get()
-        )
-        req.hicache_prefill_sparse_load = is_sparse
-        self.cache_controller.label_sparse_load(last_host_node_id, is_sparse)
+        if envs.SGLANG_HICACHE_PREFILL_SPARSE_ENABLE.get():
+            extend_input_len = req.extend_input_len
+            host_hit_length = req.host_hit_length
+            last_host_node_id = req.last_host_node.id
+            is_sparse = (
+                host_hit_length > envs.SGLANG_HICACHE_PREFILL_SPARSE_KV_LEN.get()
+                and extend_input_len
+                < envs.SGLANG_HICACHE_PREFILL_SPARSE_INPUT_LEN.get()
+            )
+            req.hicache_prefill_sparse_load = is_sparse
+            self.cache_controller.label_sparse_load(last_host_node_id, is_sparse)
+            logger.debug(
+                f"Request {req.rid} labeled for sparse load: {is_sparse} "
+                f"(host_hit_length={host_hit_length}, extend_input_len={extend_input_len})"
+            )
 
     def ready_to_load_host_cache(self) -> int:
         """
