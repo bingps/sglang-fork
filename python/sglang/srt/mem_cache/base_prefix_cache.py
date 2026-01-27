@@ -194,9 +194,7 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
 
     def label_sparse_load(
         self,
-        extend_input_len: int,
-        host_hit_length: int,
-        last_hit_node_id: int,
+        req: Req,
     ):
         """
         Label the requests that will be sparsely loaded from host to device.
