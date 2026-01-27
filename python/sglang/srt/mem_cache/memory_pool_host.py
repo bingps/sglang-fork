@@ -216,7 +216,7 @@ class HostKVCache(abc.ABC):
         """
         Load index data for NSA from the host memory pool to the device memory pool for a specific layer.
         """
-        raise NotImplementedError()
+        pass
 
     @abc.abstractmethod
     def backup_from_device_all_layer(
@@ -1174,18 +1174,17 @@ class NSATokenToKVPoolHost(MLATokenToKVPoolHost):
             f"NSA load back index {layer_id=} {host_indices.shape=} {host_indices.device=} ",
             flush=True,
         )
-        if layer_id == self.start_layer:
-            # update device_to_host_indices for load_sparse_topk during nsa
-            self.device_to_host_indices.fill_(
-                torch.iinfo(torch.int32).max
-            )  # reset for current batch
-            self.device_to_host_indices[device_indices] = host_indices
-
         host_page_indices = self._page_indices(host_indices)
         device_page_indices = self._page_indices(device_indices)
         self._copy_index_to_device(
             device_pool, host_page_indices, device_page_indices, layer_id
         )
+        if self.hicache_prefill_sparse_enable and layer_id == self.start_layer:
+            # update device_to_host_indices for load_sparse_topk during nsa
+            self.device_to_host_indices.fill_(
+                torch.iinfo(torch.int32).max
+            )  # reset for current batch
+            self.device_to_host_indices[device_indices] = host_indices
 
     def load_sparse_topk(
         self,
