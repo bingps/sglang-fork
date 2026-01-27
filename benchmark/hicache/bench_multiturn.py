@@ -147,6 +147,12 @@ def parse_args():
         default="",
         help="String of LoRA path. Currently we only support benchmarking on a single LoRA adaptor.",
     )
+    parser.add_argument(
+        "--skip-dp-ranks",
+        type=int,
+        default=0,
+        help="For skipping certain data parallel ranks during benchmarking.",
+    )
     return parser.parse_args()
 
 

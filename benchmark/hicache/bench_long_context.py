@@ -108,6 +108,11 @@ class ContextWorkloadGenerator(WorkloadGenerator):
                     )
                     request_id += 1
 
+                    skip_dp_rank_requests, request_id = self._skip_dp_rank_requests(
+                        request_id
+                    )
+                    init_requests.extend(skip_dp_rank_requests)
+
                     init_requests.append(
                         (
                             request_id,
@@ -119,9 +124,32 @@ class ContextWorkloadGenerator(WorkloadGenerator):
                         )
                     )
                     request_id += 1
+
+                    skip_dp_rank_requests, request_id = self._skip_dp_rank_requests(
+                        request_id
+                    )
+                    init_requests.extend(skip_dp_rank_requests)
+
                     all_prompt += prompt
 
         return init_requests
+
+    def _skip_dp_rank_requests(self, request_id):
+        # for skip dp ranks
+        skip_requests = []
+        for i in range(args.skip_dp_ranks):
+            skip_requests.append(
+                (
+                    request_id,
+                    gen_payload(
+                        f"{time.time()} naive prompt for skip dp rank",
+                        2,
+                        args.lora_path,
+                    ),
+                )
+            )
+            request_id += 1
+        return skip_requests, request_id
 
     def response_handler(self):
         while True:
