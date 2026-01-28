@@ -1209,9 +1209,6 @@ class NativeSparseAttnBackend(
         k_rope: Optional[torch.Tensor] = None,
         topk_indices: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        if layer.layer_id == 0:
-            print(f"{q.shape=} {k.shape=} {forward_batch.seq_lens=}", flush=True)
-
         if k is not None:
             assert v is not None
             if save_kv_cache:
