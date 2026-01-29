@@ -598,7 +598,7 @@ class HiCacheController:
                         i,
                         self.io_backend,
                     )
-                    self.mem_pool_host.load_index_to_device_per_layer(
+                    self.mem_pool_host.load_indexer_to_device_per_layer(
                         self.mem_pool_device,
                         host_indices,
                         device_indices,
@@ -606,12 +606,13 @@ class HiCacheController:
                         self.io_backend,
                     )
                 if sparse_host_indices is not None:
-                    self.mem_pool_host.load_index_to_device_per_layer(
+                    self.mem_pool_host.load_indexer_to_device_per_layer(
                         self.mem_pool_device,
                         sparse_host_indices,
                         sparse_device_indices,
                         i,
                         self.io_backend,
+                        sparse_load=True,
                     )
                 producer_event.complete(i)
             # NOTE: We must save the host indices and device indices here,
