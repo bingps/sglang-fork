@@ -228,7 +228,7 @@ async def async_request_sglang_generate(
     return output
 
 
-def gen_payload(prompt, output_len, lora_path=""):
+def gen_payload(prompt, output_len, lora_path="", rid: Optional[str] = None):
     payload = {
         "text": prompt,
         "sampling_params": {
@@ -242,6 +242,8 @@ def gen_payload(prompt, output_len, lora_path=""):
         "return_logprob": False,
         "logprob_start_len": -1,
     }
+    if rid is not None:
+        payload["rid"] = rid
     return payload
 
 

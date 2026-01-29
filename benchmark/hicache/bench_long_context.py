@@ -71,7 +71,10 @@ class ContextWorkloadGenerator(WorkloadGenerator):
             answer_len = len(
                 self.tokenizer(dataset["queries"][i]["reference_answer"])["input_ids"]
             )
-            init_requests.append((i, gen_payload(prompt, answer_len, args.lora_path)))
+            rid = f"req_{i}"
+            init_requests.append(
+                (i, gen_payload(prompt, answer_len, args.lora_path, rid=rid))
+            )
         return init_requests
 
     def _build_loopserve_requests(self, args):
@@ -83,7 +86,11 @@ class ContextWorkloadGenerator(WorkloadGenerator):
             split="train",
         )
 
-        num_conversations = min(args.num_clients, len(dataset))
+        num_conversations = (
+            min(args.num_clients, len(dataset))
+            if args.num_clients > 0
+            else len(dataset)
+        )
         init_requests = []
         request_id = 0
         for _ in range(args.num_rounds):
@@ -96,6 +103,7 @@ class ContextWorkloadGenerator(WorkloadGenerator):
                     prompt_no_question = prompt.replace(question, "", 1)
                     assert prompt_no_question == prompt[: -len(question)]
 
+                    rid = f"req_{request_id}"
                     init_requests.append(
                         (
                             request_id,
@@ -103,6 +111,7 @@ class ContextWorkloadGenerator(WorkloadGenerator):
                                 all_prompt + prompt_no_question,
                                 args.output_length,
                                 args.lora_path,
+                                rid=rid,
                             ),
                         )
                     )
@@ -113,6 +122,7 @@ class ContextWorkloadGenerator(WorkloadGenerator):
                     )
                     init_requests.extend(skip_dp_rank_requests)
 
+                    rid = f"req_{request_id}"
                     init_requests.append(
                         (
                             request_id,
@@ -120,6 +130,7 @@ class ContextWorkloadGenerator(WorkloadGenerator):
                                 all_prompt + prompt,
                                 args.output_length,
                                 args.lora_path,
+                                rid=rid,
                             ),
                         )
                     )
@@ -138,6 +149,7 @@ class ContextWorkloadGenerator(WorkloadGenerator):
         # for skip dp ranks
         skip_requests = []
         for i in range(args.skip_dp_ranks):
+            rid = f"req_{request_id}"
             skip_requests.append(
                 (
                     request_id,
@@ -145,6 +157,7 @@ class ContextWorkloadGenerator(WorkloadGenerator):
                         f"{time.time()} naive prompt for skip dp rank",
                         2,
                         args.lora_path,
+                        rid=rid,
                     ),
                 )
             )
