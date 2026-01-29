@@ -1202,22 +1202,6 @@ class NSATokenToKVPoolHost(MLATokenToKVPoolHost):
             device_pool, host_indices, device_indices, layer_id, io_backend
         )
 
-    def load_index_to_device_per_layer(
-        self, device_pool, host_indices, device_indices, layer_id, io_backend
-    ):
-        host_page_indices = self._page_indices(host_indices)
-        device_page_indices = self._page_indices(device_indices)
-        self._copy_index_to_device(
-            device_pool, host_page_indices, device_page_indices, layer_id
-        )
-        if self.hicache_prefill_sparse_enable and layer_id == self.start_layer:
-            logger.debug(f"NSA load_index_to_device_per_layer: {host_indices.shape=}")
-            # update device_to_host_indices for load_sparse_topk during nsa
-            self.device_to_host_indices.fill_(
-                torch.iinfo(torch.int32).max
-            )  # reset for current batch
-            self.device_to_host_indices[device_indices] = host_indices
-
     def load_sparse_topk(
         self,
         layer_id: int,
