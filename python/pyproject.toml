@@ -92,10 +92,17 @@ name = "pytorch-cu129"
 url = "https://download.pytorch.org/whl/cu129"
 explicit = true
 
+[[tool.uv.index]]
+name = "sglang-cu129"
+url = "https://docs.sglang.ai/whl/cu129"
+explicit = true
+
 [tool.uv.sources]
 torch = [{ index = "pytorch-cu129", marker = "sys_platform == 'linux'" }]
 torchvision = [{ index = "pytorch-cu129", marker = "sys_platform == 'linux'" }]
 torchaudio = [{ index = "pytorch-cu129", marker = "sys_platform == 'linux'" }]
+sglang-kernel = [{ index = "sglang-cu129", marker = "sys_platform == 'linux'" }]
+sgl-deep-gemm = [{ index = "sglang-cu129", marker = "sys_platform == 'linux'" }]
 
 [project.optional-dependencies]
 checkpoint-engine = ["checkpoint-engine==0.1.2"]
