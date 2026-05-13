@@ -139,6 +139,15 @@ class NSAMetadata:
     # DeepGEMM schedule metadata for paged MQA logits (decode/target_verify/draft_extend only).
     # Precomputed once per forward batch and reused across layers.
     paged_mqa_schedule_metadata: Optional[torch.Tensor] = None
+    # Speculative retrieval for MTP target verify: compute indexer top-k only
+    # for the first draft token of each request, then reuse it for sibling draft
+    # tokens. These tensors describe that reduced per-request view.
+    mtp_specret_enabled: bool = False
+    mtp_specret_page_table_1: Optional[torch.Tensor] = None
+    mtp_specret_real_page_table: Optional[torch.Tensor] = None
+    mtp_specret_seqlens: Optional[torch.Tensor] = None
+    mtp_specret_cu_seqlens_q: Optional[torch.Tensor] = None
+    mtp_specret_paged_mqa_schedule_metadata: Optional[torch.Tensor] = None
     # The sum of sequence lengths for key, prefill only
     seq_lens_sum: Optional[int] = None
     # The flattened 1D page table with shape (seq_lens_sum,), prefill only
@@ -191,6 +200,8 @@ class NSAIndexerMetadata(BaseIndexerMetadata):
     attn_metadata: NSAMetadata
     topk_transform_method: TopkTransformMethod
     paged_mqa_schedule_metadata: Optional[torch.Tensor] = None
+    enable_mtp_specret: bool = False
+    mtp_specret_draft_token_num: int = 0
     force_unfused_topk: bool = False
 
     def get_seqlens_int32(self) -> torch.Tensor:
@@ -229,8 +240,10 @@ class NSAIndexerMetadata(BaseIndexerMetadata):
         topk: int,
         ks: Optional[torch.Tensor] = None,
         cu_seqlens_q: torch.Tensor = None,
+        cu_seqlens_q_topk_override: Optional[torch.Tensor] = None,
         ke_offset: torch.Tensor = None,
         batch_idx_list: List[int] = None,
+        page_table_size_1_override: Optional[torch.Tensor] = None,
         topk_indices_offset_override: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         from sgl_kernel import (
@@ -239,7 +252,10 @@ class NSAIndexerMetadata(BaseIndexerMetadata):
             fast_topk_v2,
         )
 
-        if topk_indices_offset_override is not None:
+        if cu_seqlens_q_topk_override is not None:
+            cu_seqlens_q_topk = cu_seqlens_q_topk_override
+            cu_topk_indices_offset = topk_indices_offset_override
+        elif topk_indices_offset_override is not None:
             cu_topk_indices_offset = topk_indices_offset_override
             cu_seqlens_q_topk = None
         elif cu_seqlens_q is not None:
@@ -256,7 +272,9 @@ class NSAIndexerMetadata(BaseIndexerMetadata):
             seq_lens_topk = ke_offset
         else:
             seq_lens_topk = self.get_seqlens_expanded()
-        if batch_idx_list is not None:
+        if page_table_size_1_override is not None:
+            page_table_size_1 = page_table_size_1_override
+        elif batch_idx_list is not None:
             page_table_size_1 = self.attn_metadata.page_table_1[batch_idx_list]
         else:
             page_table_size_1 = self.attn_metadata.page_table_1
@@ -370,10 +388,21 @@ class NativeSparseAttnBackend(
         # Speculative decoding
         self.topk = model_runner.server_args.speculative_eagle_topk or 0
         self.speculative_num_steps = speculative_num_steps
+        self.mtp_specret_num_steps = (
+            speculative_num_steps
+            or model_runner.server_args.speculative_num_steps
+            or 0
+        )
         self.speculative_num_draft_tokens = (
             model_runner.server_args.speculative_num_draft_tokens
         )
         self.speculative_step_id = speculative_step_id
+        hf_config = model_runner.model_config.hf_config
+        self.enable_specret = (
+            envs.SGLANG_NSA_ENABLE_SPECRET.get()
+            or getattr(hf_config, "enable_specret", False)
+            or getattr(hf_config, "specret", False)
+        )
 
         self.device_capability = torch.cuda.get_device_capability()
         self.device_sm_major = self.device_capability[0]
@@ -400,6 +429,28 @@ class NativeSparseAttnBackend(
             )
         return self._arange_buf[:l]
 
+    def _enable_mtp_specret(self, forward_mode: ForwardMode) -> bool:
+        return (
+            self.enable_specret
+            and is_cuda()
+            and forward_mode.is_target_verify()
+            and self.mtp_specret_num_steps > 1
+            and self.topk == 1
+            and (self.speculative_num_draft_tokens or 0) > 1
+        )
+
+    def _enable_mtp_specret_for_batch(
+        self,
+        forward_mode: ForwardMode,
+        seq_lens_cpu: Optional[torch.Tensor],
+    ) -> bool:
+        return (
+            self._enable_mtp_specret(forward_mode)
+            and seq_lens_cpu is not None
+            and len(seq_lens_cpu) > 0
+            and int(seq_lens_cpu.min().item()) >= self.nsa_index_topk
+        )
+
     def _transform_table_1_to_real(self, page_table: torch.Tensor) -> torch.Tensor:
         page_size = self.real_page_size
         if page_size == 1:
@@ -409,6 +460,96 @@ class NativeSparseAttnBackend(
             0, max_seqlen_k, page_size, device=page_table.device, dtype=torch.int32
         )
         return page_table[:, strided_indices] // page_size
+
+    def _get_mtp_specret_seqlens(
+        self, seqlens_expanded: torch.Tensor, batch_size: int
+    ) -> torch.Tensor:
+        return seqlens_expanded.reshape(
+            batch_size, self.speculative_num_draft_tokens
+        )[:, 0].contiguous()
+
+    def _compute_paged_mqa_schedule_metadata(
+        self, seqlens_32: torch.Tensor, batch_size: int
+    ) -> Optional[torch.Tensor]:
+        if not is_cuda():
+            return None
+        try:
+            import deep_gemm
+
+            seqlens_32_2d = _to_2d_context_lens(seqlens_32, batch_size)
+            return deep_gemm.get_paged_mqa_logits_metadata(
+                seqlens_32_2d, 64, deep_gemm.get_num_sms()
+            )
+        except (ImportError, ModuleNotFoundError):
+            return None
+
+    def _update_mtp_specret_metadata(
+        self,
+        metadata: NSAMetadata,
+        page_table_1: torch.Tensor,
+        seqlens_expanded: torch.Tensor,
+        batch_size: int,
+    ) -> None:
+        if not metadata.mtp_specret_enabled:
+            return
+
+        mtp_specret_seqlens = self._get_mtp_specret_seqlens(
+            seqlens_expanded, batch_size
+        )
+
+        if metadata.mtp_specret_page_table_1 is None:
+            object.__setattr__(
+                metadata, "mtp_specret_page_table_1", page_table_1.contiguous()
+            )
+        else:
+            metadata.mtp_specret_page_table_1[:, : page_table_1.shape[1]].copy_(
+                page_table_1
+            )
+
+        if self.real_page_size > 1:
+            real_page_table = self._transform_table_1_to_real(page_table_1)
+            if metadata.mtp_specret_real_page_table is None:
+                object.__setattr__(
+                    metadata, "mtp_specret_real_page_table", real_page_table.contiguous()
+                )
+            else:
+                metadata.mtp_specret_real_page_table[
+                    :, : real_page_table.shape[1]
+                ].copy_(real_page_table)
+        elif metadata.mtp_specret_real_page_table is None:
+            object.__setattr__(
+                metadata,
+                "mtp_specret_real_page_table",
+                metadata.mtp_specret_page_table_1,
+            )
+
+        if metadata.mtp_specret_seqlens is None:
+            object.__setattr__(
+                metadata, "mtp_specret_seqlens", mtp_specret_seqlens
+            )
+        else:
+            metadata.mtp_specret_seqlens.copy_(mtp_specret_seqlens)
+
+        if metadata.mtp_specret_cu_seqlens_q is None:
+            object.__setattr__(
+                metadata,
+                "mtp_specret_cu_seqlens_q",
+                self.get_device_int32_arange(batch_size + 1),
+            )
+
+        new_schedule = self._compute_paged_mqa_schedule_metadata(
+            mtp_specret_seqlens, batch_size
+        )
+        if metadata.mtp_specret_paged_mqa_schedule_metadata is None:
+            object.__setattr__(
+                metadata, "mtp_specret_paged_mqa_schedule_metadata", new_schedule
+            )
+        elif new_schedule is not None:
+            metadata.mtp_specret_paged_mqa_schedule_metadata.copy_(new_schedule)
+        else:
+            object.__setattr__(
+                metadata, "mtp_specret_paged_mqa_schedule_metadata", None
+            )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
@@ -423,6 +564,9 @@ class NativeSparseAttnBackend(
         cache_seqlens_int32 = (forward_batch.seq_lens + draft_token_num).to(torch.int32)
         cu_seqlens_k = compute_cu_seqlens(cache_seqlens_int32)
         assert forward_batch.seq_lens_cpu is not None
+        mtp_specret_enabled = self._enable_mtp_specret_for_batch(
+            forward_batch.forward_mode, forward_batch.seq_lens_cpu
+        )
         max_seqlen_k = int(forward_batch.seq_lens_cpu.max().item() + draft_token_num)
         # [b, max_seqlen_k]
         page_table = forward_batch.req_to_token_pool.req_to_token[
@@ -455,6 +599,7 @@ class NativeSparseAttnBackend(
         # seq_len_cpu of selected sequences
         indexer_seq_lens_cpu = forward_batch.seq_lens_cpu
         indexer_seq_lens = forward_batch.seq_lens
+        mtp_specret_page_table_1 = None
 
         if forward_batch.forward_mode.is_decode_or_idle():
             extend_seq_lens_cpu = [1] * batch_size
@@ -479,6 +624,8 @@ class NativeSparseAttnBackend(
                 self.speculative_num_draft_tokens * batch_size,
                 self.speculative_num_draft_tokens,
             )
+            if mtp_specret_enabled:
+                mtp_specret_page_table_1 = page_table
             page_table = torch.repeat_interleave(
                 page_table, repeats=self.speculative_num_draft_tokens, dim=0
             )
@@ -646,26 +793,17 @@ class NativeSparseAttnBackend(
             or forward_batch.forward_mode.is_target_verify()
             or forward_batch.forward_mode.is_draft_extend(include_v2=True)
         ):
-            try:
-                import deep_gemm
-
-                # NOTE: DeepGEMM paged path uses block_size=64.
-                seqlens_32 = (
-                    seqlens_expanded
-                    if (
-                        forward_batch.forward_mode.is_target_verify()
-                        or forward_batch.forward_mode.is_draft_extend(include_v2=True)
-                    )
-                    else cache_seqlens_int32
+            seqlens_32 = (
+                seqlens_expanded
+                if (
+                    forward_batch.forward_mode.is_target_verify()
+                    or forward_batch.forward_mode.is_draft_extend(include_v2=True)
                 )
-                seqlens_32_2d = _to_2d_context_lens(
-                    seqlens_32, forward_batch.batch_size
-                )
-                paged_mqa_schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
-                    seqlens_32_2d, 64, deep_gemm.get_num_sms()
-                )
-            except (ImportError, ModuleNotFoundError):
-                paged_mqa_schedule_metadata = None
+                else cache_seqlens_int32
+            )
+            paged_mqa_schedule_metadata = self._compute_paged_mqa_schedule_metadata(
+                seqlens_32, forward_batch.batch_size
+            )
 
         metadata = NSAMetadata(
             page_size=self.real_page_size,
@@ -686,6 +824,7 @@ class NativeSparseAttnBackend(
                 else None
             ),
             paged_mqa_schedule_metadata=paged_mqa_schedule_metadata,
+            mtp_specret_enabled=mtp_specret_enabled,
             nsa_cache_seqlens_int32=nsa_cache_seqlens_int32,
             nsa_cu_seqlens_q=nsa_cu_seqlens_q,
             nsa_cu_seqlens_k=nsa_cu_seqlens_k,
@@ -699,6 +838,10 @@ class NativeSparseAttnBackend(
             indexer_seq_lens=indexer_seq_lens,
             token_to_batch_idx=token_to_batch_idx,
         )
+        if mtp_specret_page_table_1 is not None:
+            self._update_mtp_specret_metadata(
+                metadata, mtp_specret_page_table_1, seqlens_expanded, batch_size
+            )
         self.forward_metadata = metadata
 
     def _cal_indexer_k_start_end(
@@ -805,6 +948,12 @@ class NativeSparseAttnBackend(
                 dtype=torch.int32,
                 device=self.device,
             ),
+            "mtp_specret_page_table": torch.zeros(
+                max_bs,
+                self.max_context_len + (self.speculative_num_draft_tokens or 0),
+                dtype=torch.int32,
+                device=self.device,
+            ),
             "flashmla_metadata": (
                 self._compute_flashmla_metadata(
                     cache_seqlens=torch.ones(
@@ -830,6 +979,8 @@ class NativeSparseAttnBackend(
         self.set_nsa_prefill_impl(forward_batch=None)
 
         """Initialize forward metadata for capturing CUDA graph."""
+        mtp_specret_enabled = False
+        mtp_specret_page_table_1 = None
         if forward_mode.is_decode_or_idle():
             # Normal Decode
             # Get sequence information
@@ -867,6 +1018,12 @@ class NativeSparseAttnBackend(
         elif forward_mode.is_target_verify() or forward_mode.is_draft_extend(
             include_v2=True
         ):
+            seq_lens_cpu_values = seq_lens.tolist()
+            mtp_specret_enabled = (
+                self._enable_mtp_specret(forward_mode)
+                and len(seq_lens_cpu_values) > 0
+                and min(seq_lens_cpu_values) >= self.nsa_index_topk
+            )
             cache_seqlens_int32 = (seq_lens + self.speculative_num_draft_tokens).to(
                 torch.int32
             )
@@ -875,6 +1032,10 @@ class NativeSparseAttnBackend(
             page_table_1 = self.decode_cuda_graph_metadata["page_table"][
                 : bs * self.speculative_num_draft_tokens, :
             ]
+            if mtp_specret_enabled:
+                mtp_specret_page_table_1 = self.decode_cuda_graph_metadata[
+                    "mtp_specret_page_table"
+                ][:bs, :]
             max_seqlen_k = page_table_1.shape[1]
 
             cu_seqlens_q = torch.arange(
@@ -889,7 +1050,7 @@ class NativeSparseAttnBackend(
 
             seqlens_int32_cpu = [
                 self.speculative_num_draft_tokens + kv_len
-                for kv_len in seq_lens.tolist()
+                for kv_len in seq_lens_cpu_values
             ]
             seqlens_expanded = torch.cat(
                 [
@@ -935,23 +1096,17 @@ class NativeSparseAttnBackend(
             or forward_mode.is_target_verify()
             or forward_mode.is_draft_extend(include_v2=True)
         ):
-            try:
-                import deep_gemm
-
-                seqlens_32 = (
-                    seqlens_expanded
-                    if (
-                        forward_mode.is_target_verify()
-                        or forward_mode.is_draft_extend(include_v2=True)
-                    )
-                    else cache_seqlens_int32
+            seqlens_32 = (
+                seqlens_expanded
+                if (
+                    forward_mode.is_target_verify()
+                    or forward_mode.is_draft_extend(include_v2=True)
                 )
-                seqlens_32_2d = _to_2d_context_lens(seqlens_32, bs)
-                paged_mqa_schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
-                    seqlens_32_2d, 64, deep_gemm.get_num_sms()
-                )
-            except (ImportError, ModuleNotFoundError):
-                paged_mqa_schedule_metadata = None
+                else cache_seqlens_int32
+            )
+            paged_mqa_schedule_metadata = self._compute_paged_mqa_schedule_metadata(
+                seqlens_32, bs
+            )
 
         metadata = NSAMetadata(
             page_size=self.real_page_size,
@@ -963,6 +1118,7 @@ class NativeSparseAttnBackend(
             page_table_1=page_table_1,
             flashmla_metadata=flashmla_metadata,
             paged_mqa_schedule_metadata=paged_mqa_schedule_metadata,
+            mtp_specret_enabled=mtp_specret_enabled,
             nsa_cache_seqlens_int32=nsa_cache_seqlens_int32,
             nsa_cu_seqlens_q=nsa_cu_seqlens_q,
             nsa_cu_seqlens_k=nsa_cu_seqlens_k,
@@ -970,6 +1126,47 @@ class NativeSparseAttnBackend(
             real_page_table=real_page_table,
             nsa_extend_seq_lens_list=nsa_extend_seq_lens_list,
         )
+        if mtp_specret_page_table_1 is not None:
+            self._update_mtp_specret_metadata(
+                metadata, mtp_specret_page_table_1, seqlens_expanded, bs
+            )
+        elif self._enable_mtp_specret(forward_mode):
+            # Pre-allocate mtp_specret buffers for CUDA graph even when specret
+            # is disabled for the capture batch (dummy seq_lens < nsa_index_topk).
+            # During replay with real seq_lens the buffers will be reused via
+            # in-place copy, avoiding dynamic allocation that would cause shape
+            # mismatches as sequences grow.
+            mtp_pt = self.decode_cuda_graph_metadata["mtp_specret_page_table"][
+                :bs, :
+            ]
+            object.__setattr__(metadata, "mtp_specret_page_table_1", mtp_pt)
+            if self.real_page_size > 1:
+                real_pt = self._transform_table_1_to_real(mtp_pt)
+                object.__setattr__(
+                    metadata, "mtp_specret_real_page_table", real_pt
+                )
+            else:
+                object.__setattr__(
+                    metadata, "mtp_specret_real_page_table", mtp_pt
+                )
+            object.__setattr__(
+                metadata,
+                "mtp_specret_seqlens",
+                torch.ones(bs, dtype=torch.int32, device=self.device),
+            )
+            object.__setattr__(
+                metadata,
+                "mtp_specret_cu_seqlens_q",
+                self.get_device_int32_arange(bs + 1),
+            )
+            dummy_schedule = self._compute_paged_mqa_schedule_metadata(
+                metadata.mtp_specret_seqlens, bs
+            )
+            object.__setattr__(
+                metadata,
+                "mtp_specret_paged_mqa_schedule_metadata",
+                dummy_schedule,
+            )
         self.decode_cuda_graph_metadata[bs] = metadata
         self.forward_metadata = metadata
 
@@ -997,6 +1194,11 @@ class NativeSparseAttnBackend(
 
         # Normal Decode
         metadata: NSAMetadata = self.decode_cuda_graph_metadata[bs]
+        mtp_specret_enabled = self._enable_mtp_specret_for_batch(
+            forward_mode, seq_lens_cpu
+        )
+        object.__setattr__(metadata, "mtp_specret_enabled", mtp_specret_enabled)
+        mtp_specret_page_table_1 = None
         if forward_mode.is_decode_or_idle():
             # Normal Decode
             max_len = int(seq_lens_cpu.max().item())
@@ -1026,6 +1228,8 @@ class NativeSparseAttnBackend(
                 torch.cumsum(cache_seqlens, dim=0, dtype=torch.int32)
             )
             page_indices = self.req_to_token[req_pool_indices, :max_seqlen_k]
+            if mtp_specret_enabled:
+                mtp_specret_page_table_1 = page_indices
             page_indices = torch.repeat_interleave(
                 page_indices, repeats=self.speculative_num_draft_tokens, dim=0
             )
@@ -1086,29 +1290,27 @@ class NativeSparseAttnBackend(
             or forward_mode.is_target_verify()
             or forward_mode.is_draft_extend(include_v2=True)
         ):
-            try:
-                import deep_gemm
-
-                seqlens_32 = (
-                    seqlens_expanded
-                    if (
-                        forward_mode.is_target_verify()
-                        or forward_mode.is_draft_extend(include_v2=True)
-                    )
-                    else metadata.cache_seqlens_int32
+            seqlens_32 = (
+                seqlens_expanded
+                if (
+                    forward_mode.is_target_verify()
+                    or forward_mode.is_draft_extend(include_v2=True)
                 )
-                seqlens_32_2d = _to_2d_context_lens(seqlens_32, bs)
-                new_schedule = deep_gemm.get_paged_mqa_logits_metadata(
-                    seqlens_32_2d, 64, deep_gemm.get_num_sms()
+                else metadata.cache_seqlens_int32
+            )
+            new_schedule = self._compute_paged_mqa_schedule_metadata(seqlens_32, bs)
+            if metadata.paged_mqa_schedule_metadata is None:
+                object.__setattr__(
+                    metadata, "paged_mqa_schedule_metadata", new_schedule
                 )
-                if metadata.paged_mqa_schedule_metadata is None:
-                    object.__setattr__(
-                        metadata, "paged_mqa_schedule_metadata", new_schedule
-                    )
-                else:
-                    metadata.paged_mqa_schedule_metadata.copy_(new_schedule)
-            except (ImportError, ModuleNotFoundError):
+            elif new_schedule is not None:
+                metadata.paged_mqa_schedule_metadata.copy_(new_schedule)
+            else:
                 object.__setattr__(metadata, "paged_mqa_schedule_metadata", None)
+        if mtp_specret_page_table_1 is not None:
+            self._update_mtp_specret_metadata(
+                metadata, mtp_specret_page_table_1, seqlens_expanded, bs
+            )
         seqlens_expanded_size = seqlens_expanded.shape[0]
         assert (
             metadata.nsa_cache_seqlens_int32 is not None
@@ -1300,27 +1502,34 @@ class NativeSparseAttnBackend(
         # deadlock the kernel when the runtime work decomposition diverges from
         # the captured one).
         if is_cuda():
-            try:
-                import deep_gemm
-
-                if forward_mode.is_decode_or_idle():
-                    seqlens_32 = metadata.cache_seqlens_int32
-                else:
-                    seqlens_32 = metadata.nsa_seqlens_expanded[
-                        : precomputed.seqlens_expanded_size
-                    ]
-                seqlens_32_2d = _to_2d_context_lens(seqlens_32, bs)
-                new_schedule = deep_gemm.get_paged_mqa_logits_metadata(
-                    seqlens_32_2d, 64, deep_gemm.get_num_sms()
+            if forward_mode.is_decode_or_idle():
+                seqlens_32 = metadata.cache_seqlens_int32
+            else:
+                seqlens_32 = metadata.nsa_seqlens_expanded[
+                    : precomputed.seqlens_expanded_size
+                ]
+            new_schedule = self._compute_paged_mqa_schedule_metadata(seqlens_32, bs)
+            if metadata.paged_mqa_schedule_metadata is None:
+                object.__setattr__(
+                    metadata, "paged_mqa_schedule_metadata", new_schedule
                 )
-                if metadata.paged_mqa_schedule_metadata is None:
-                    object.__setattr__(
-                        metadata, "paged_mqa_schedule_metadata", new_schedule
-                    )
-                else:
-                    metadata.paged_mqa_schedule_metadata.copy_(new_schedule)
-            except (ImportError, ModuleNotFoundError):
-                pass
+            elif new_schedule is not None:
+                metadata.paged_mqa_schedule_metadata.copy_(new_schedule)
+            else:
+                object.__setattr__(metadata, "paged_mqa_schedule_metadata", None)
+
+        if forward_mode.is_target_verify() and metadata.mtp_specret_enabled:
+            mtp_specret_page_table_1 = precomputed.page_indices.reshape(
+                bs,
+                self.speculative_num_draft_tokens,
+                precomputed.page_indices.shape[1],
+            )[:, 0, :]
+            self._update_mtp_specret_metadata(
+                metadata,
+                mtp_specret_page_table_1,
+                metadata.nsa_seqlens_expanded[: precomputed.seqlens_expanded_size],
+                bs,
+            )
 
         self.forward_metadata = metadata
 
@@ -2265,12 +2474,17 @@ class NativeSparseAttnBackend(
             forward_batch.hisparse_coordinator is not None
             and forward_batch.forward_mode.is_decode_or_idle()
         )
+        enable_mtp_specret = self.forward_metadata.mtp_specret_enabled
         return NSAIndexerMetadata(
             attn_metadata=self.forward_metadata,
             topk_transform_method=self.get_topk_transform_method(
                 forward_batch.forward_mode
             ),
             paged_mqa_schedule_metadata=self.forward_metadata.paged_mqa_schedule_metadata,
+            enable_mtp_specret=enable_mtp_specret,
+            mtp_specret_draft_token_num=(
+                self.speculative_num_draft_tokens if enable_mtp_specret else 0
+            ),
             force_unfused_topk=force_unfused,
         )
 

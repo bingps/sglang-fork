@@ -488,7 +488,57 @@ class Indexer(MultiPlatformOp):
         # When attn_tp_size > 1 or in the MAX_LEN padding mode, padding may exist in the hidden states,
         # and it is necessary to extract the actual q length.
         q_offset = sum(metadata.get_nsa_extend_len_cpu())
-        if _is_hip:
+        draft_token_num = getattr(metadata, "mtp_specret_draft_token_num", 0)
+        use_mtp_specret = getattr(metadata, "enable_mtp_specret", False)
+        topk_result = None
+        if use_mtp_specret:
+            attn_metadata = metadata.attn_metadata
+            mtp_q_num = q_offset // draft_token_num
+            mtp_block_tables = attn_metadata.mtp_specret_real_page_table
+            mtp_page_table_1 = attn_metadata.mtp_specret_page_table_1
+            mtp_seqlens = attn_metadata.mtp_specret_seqlens
+            mtp_cu_seqlens_q = attn_metadata.mtp_specret_cu_seqlens_q
+            mtp_schedule_metadata = (
+                attn_metadata.mtp_specret_paged_mqa_schedule_metadata
+            )
+
+            q_mtp = (
+                q_fp8[:q_offset]
+                .reshape(mtp_q_num, draft_token_num, *q_fp8.shape[1:])
+                [:, 0]
+                .contiguous()
+            )
+            weights_mtp = (
+                weights[:q_offset]
+                .reshape(mtp_q_num, draft_token_num, weights.shape[1])
+                [:, 0]
+                .contiguous()
+            )
+            seqlens_mtp_2d = mtp_seqlens.unsqueeze(-1)
+            if mtp_schedule_metadata is None:
+                mtp_schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
+                    seqlens_mtp_2d, blocksize, self.sm_count
+                )
+
+            logits = deep_gemm.fp8_paged_mqa_logits(
+                q_mtp,
+                kv_cache_fp8,
+                weights_mtp,
+                seqlens_mtp_2d,
+                mtp_block_tables,
+                mtp_schedule_metadata,
+                max_seq_len,
+                clean_logits=False,
+            )
+            topk_mtp = metadata.topk_transform(
+                logits,
+                self.index_topk,
+                ke_offset=mtp_seqlens,
+                cu_seqlens_q_topk_override=mtp_cu_seqlens_q,
+                page_table_size_1_override=mtp_page_table_1,
+            )
+            topk_result = topk_mtp.repeat_interleave(draft_token_num, dim=0)
+        elif _is_hip:
             from aiter.ops.triton.pa_mqa_logits import deepgemm_fp8_paged_mqa_logits
 
             batch_size, next_n, heads, _ = q_fp8.shape
@@ -509,6 +559,8 @@ class Indexer(MultiPlatformOp):
                 Preshuffle=False,
                 KVBlockSize=block_kv,
             )
+            # NOTE(dark): logits should be cleaned in topk_transform
+            topk_result = metadata.topk_transform(logits, self.index_topk)
         else:
             logits = deep_gemm.fp8_paged_mqa_logits(
                 q_fp8[:q_offset],
@@ -521,8 +573,8 @@ class Indexer(MultiPlatformOp):
                 clean_logits=False,
             )
 
-        # NOTE(dark): logits should be cleaned in topk_transform
-        topk_result = metadata.topk_transform(logits, self.index_topk)
+            # NOTE(dark): logits should be cleaned in topk_transform
+            topk_result = metadata.topk_transform(logits, self.index_topk)
         # Restore possible padding exist in the hidden states.
         if not _is_hip and q_offset < q_fp8.shape[0]:
             pad_len = q_fp8.shape[0] - q_offset
