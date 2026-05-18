@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import contextlib
+import os
+import time
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 
@@ -13,6 +15,7 @@ from sglang.jit_kernel.fused_store_index_cache import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import attn_tp_all_gather_into_tensor
+from sglang.srt.layers.dp_attention import get_attention_tp_rank
 from sglang.srt.layers.layernorm import LayerNorm
 from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype, is_fp8_fnuz
 from sglang.srt.layers.utils import MultiPlatformOp
@@ -508,6 +511,8 @@ class Indexer(MultiPlatformOp):
                 [:, 0]
                 .contiguous()
             )
+            if layer_id == 0:
+                print(f"{get_attention_tp_rank()=} {q_fp8.shape=} {q_mtp.shape=}")
             weights_mtp = (
                 weights[:q_offset]
                 .reshape(mtp_q_num, draft_token_num, weights.shape[1])
@@ -578,6 +583,10 @@ class Indexer(MultiPlatformOp):
 
             # NOTE(dark): logits should be cleaned in topk_transform
             topk_result = metadata.topk_transform(logits, self.index_topk)
+        if not use_mtp_specret:
+            self._dump_target_verify_draft_topk(
+                forward_batch, layer_id, topk_result, metadata, q_offset
+            )
         # Restore possible padding exist in the hidden states.
         if not _is_hip and q_offset < q_fp8.shape[0]:
             pad_len = q_fp8.shape[0] - q_offset
@@ -589,6 +598,54 @@ class Indexer(MultiPlatformOp):
             )
             topk_result = torch.cat([topk_result, padding], dim=0)
         return topk_result
+
+    def _dump_target_verify_draft_topk(
+        self,
+        forward_batch: ForwardBatch,
+        layer_id: int,
+        topk_result: torch.Tensor,
+        metadata: BaseIndexerMetadata,
+        q_offset: int,
+    ) -> None:
+        if (
+            not envs.SGLANG_NSA_DUMP_DRAFT_TOPK.get()
+            or get_attention_tp_rank() != 0
+            or not forward_batch.forward_mode.is_target_verify()
+            or q_offset <= 0
+            or topk_result.numel() == 0
+        ):
+            return
+
+        dump_dir = envs.SGLANG_NSA_DRAFT_TOPK_DUMP_DIR.get()
+        if not dump_dir:
+            return
+
+        extend_lens = metadata.get_nsa_extend_len_cpu()
+        seqlens_expanded = metadata.get_seqlens_expanded()
+        payload = {
+            "version": 1,
+            "pid": os.getpid(),
+            "layer_id": layer_id,
+            "index_topk": self.index_topk,
+            "q_offset": q_offset,
+            "extend_seq_lens": list(extend_lens),
+            "assumed_batch_size": len(extend_lens),
+            "topk": topk_result[:q_offset].detach().cpu(),
+            "seqlens_expanded": seqlens_expanded[:q_offset].detach().cpu(),
+            "fused_topk": envs.SGLANG_NSA_FUSE_TOPK.get()
+            and not getattr(metadata, "force_unfused_topk", False),
+            "topk_transform_method": str(getattr(metadata, "topk_transform_method", "")),
+        }
+
+        try:
+            os.makedirs(dump_dir, exist_ok=True)
+            path = os.path.join(
+                dump_dir,
+                f"nsa_draft_topk_pid{os.getpid()}_layer{layer_id}_{time.time_ns()}.pt",
+            )
+            torch.save(payload, path)
+        except Exception as e:
+            print(f"Warning: failed to dump NSA draft topk: {e}")
 
     def _patch_mtp_specret_sibling_self_kv(
         self,

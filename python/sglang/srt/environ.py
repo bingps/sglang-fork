@@ -420,6 +420,8 @@ class Envs:
     # NSA Backend
     SGLANG_NSA_FUSE_TOPK = EnvBool(True)
     SGLANG_NSA_ENABLE_SPECRET = EnvBool(False)
+    SGLANG_NSA_DUMP_DRAFT_TOPK = EnvBool(False)
+    SGLANG_NSA_DRAFT_TOPK_DUMP_DIR = EnvStr("/tmp/sglang_nsa_draft_topk")
     SGLANG_NSA_ENABLE_MTP_PRECOMPUTE_METADATA = EnvBool(True)
     SGLANG_USE_FUSED_METADATA_COPY = EnvBool(True)
     SGLANG_NSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD = EnvInt(2048)
