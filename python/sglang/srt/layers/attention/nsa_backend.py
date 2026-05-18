@@ -148,6 +148,9 @@ class NSAMetadata:
     mtp_specret_seqlens: Optional[torch.Tensor] = None
     mtp_specret_cu_seqlens_q: Optional[torch.Tensor] = None
     mtp_specret_paged_mqa_schedule_metadata: Optional[torch.Tensor] = None
+    mtp_specret_sibling_rows: Optional[torch.Tensor] = None
+    mtp_specret_sibling_self_logical_indices: Optional[torch.Tensor] = None
+    mtp_specret_sibling_self_page_indices: Optional[torch.Tensor] = None
     # The sum of sequence lengths for key, prefill only
     seq_lens_sum: Optional[int] = None
     # The flattened 1D page table with shape (seq_lens_sum,), prefill only
@@ -496,6 +499,17 @@ class NativeSparseAttnBackend(
         mtp_specret_seqlens = self._get_mtp_specret_seqlens(
             seqlens_expanded, batch_size
         )
+        q_offset = batch_size * self.speculative_num_draft_tokens
+        row_ids = torch.arange(q_offset, device=self.device, dtype=torch.int64)
+        sibling_rows = row_ids[row_ids.remainder(self.speculative_num_draft_tokens) > 0]
+        sibling_logical_indices = (
+            seqlens_expanded[:q_offset].to(torch.int64)[sibling_rows] - 1
+        )
+        sibling_batch_rows = sibling_rows // self.speculative_num_draft_tokens
+        sibling_self_page_indices = page_table_1[
+            sibling_batch_rows, sibling_logical_indices
+        ]
+        sibling_self_logical_indices = sibling_logical_indices.to(torch.int32)
 
         if metadata.mtp_specret_page_table_1 is None:
             object.__setattr__(
@@ -535,6 +549,35 @@ class NativeSparseAttnBackend(
                 metadata,
                 "mtp_specret_cu_seqlens_q",
                 self.get_device_int32_arange(batch_size + 1),
+            )
+
+        if metadata.mtp_specret_sibling_rows is None:
+            object.__setattr__(
+                metadata, "mtp_specret_sibling_rows", sibling_rows.contiguous()
+            )
+        else:
+            metadata.mtp_specret_sibling_rows.copy_(sibling_rows)
+
+        if metadata.mtp_specret_sibling_self_logical_indices is None:
+            object.__setattr__(
+                metadata,
+                "mtp_specret_sibling_self_logical_indices",
+                sibling_self_logical_indices.contiguous(),
+            )
+        else:
+            metadata.mtp_specret_sibling_self_logical_indices.copy_(
+                sibling_self_logical_indices
+            )
+
+        if metadata.mtp_specret_sibling_self_page_indices is None:
+            object.__setattr__(
+                metadata,
+                "mtp_specret_sibling_self_page_indices",
+                sibling_self_page_indices.contiguous(),
+            )
+        else:
+            metadata.mtp_specret_sibling_self_page_indices.copy_(
+                sibling_self_page_indices
             )
 
         new_schedule = self._compute_paged_mqa_schedule_metadata(
@@ -1158,6 +1201,28 @@ class NativeSparseAttnBackend(
                 metadata,
                 "mtp_specret_cu_seqlens_q",
                 self.get_device_int32_arange(bs + 1),
+            )
+            q_offset = bs * self.speculative_num_draft_tokens
+            row_ids = torch.arange(q_offset, device=self.device, dtype=torch.int64)
+            sibling_rows = row_ids[
+                row_ids.remainder(self.speculative_num_draft_tokens) > 0
+            ]
+            object.__setattr__(
+                metadata, "mtp_specret_sibling_rows", sibling_rows.contiguous()
+            )
+            object.__setattr__(
+                metadata,
+                "mtp_specret_sibling_self_logical_indices",
+                torch.zeros(
+                    sibling_rows.shape[0], dtype=torch.int32, device=self.device
+                ),
+            )
+            object.__setattr__(
+                metadata,
+                "mtp_specret_sibling_self_page_indices",
+                torch.zeros(
+                    sibling_rows.shape[0], dtype=torch.int32, device=self.device
+                ),
             )
             dummy_schedule = self._compute_paged_mqa_schedule_metadata(
                 metadata.mtp_specret_seqlens, bs

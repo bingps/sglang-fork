@@ -538,6 +538,9 @@ class Indexer(MultiPlatformOp):
                 page_table_size_1_override=mtp_page_table_1,
             )
             topk_result = topk_mtp.repeat_interleave(draft_token_num, dim=0)
+            topk_result = self._patch_mtp_specret_sibling_self_kv(
+                topk_result, metadata, draft_token_num, q_offset
+            )
         elif _is_hip:
             from aiter.ops.triton.pa_mqa_logits import deepgemm_fp8_paged_mqa_logits
 
@@ -585,6 +588,31 @@ class Indexer(MultiPlatformOp):
                 device=topk_result.device,
             )
             topk_result = torch.cat([topk_result, padding], dim=0)
+        return topk_result
+
+    def _patch_mtp_specret_sibling_self_kv(
+        self,
+        topk_result: torch.Tensor,
+        metadata: BaseIndexerMetadata,
+        draft_token_num: int,
+        q_offset: int,
+    ) -> torch.Tensor:
+        if draft_token_num <= 1 or q_offset == 0 or topk_result.numel() == 0:
+            return topk_result
+
+        attn_metadata = metadata.attn_metadata
+        sibling_rows = attn_metadata.mtp_specret_sibling_rows
+        if sibling_rows is None or sibling_rows.numel() == 0:
+            return topk_result
+
+        if envs.SGLANG_NSA_FUSE_TOPK.get() and not getattr(
+            metadata, "force_unfused_topk", False
+        ):
+            self_kv = attn_metadata.mtp_specret_sibling_self_page_indices
+        else:
+            self_kv = attn_metadata.mtp_specret_sibling_self_logical_indices
+
+        topk_result[sibling_rows, -1] = self_kv.to(topk_result.dtype)
         return topk_result
 
     def _should_chunk_mqa_logits(
