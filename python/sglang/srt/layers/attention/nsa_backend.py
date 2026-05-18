@@ -1518,19 +1518,6 @@ class NativeSparseAttnBackend(
             else:
                 object.__setattr__(metadata, "paged_mqa_schedule_metadata", None)
 
-        if forward_mode.is_target_verify() and metadata.mtp_specret_enabled:
-            mtp_specret_page_table_1 = precomputed.page_indices.reshape(
-                bs,
-                self.speculative_num_draft_tokens,
-                precomputed.page_indices.shape[1],
-            )[:, 0, :]
-            self._update_mtp_specret_metadata(
-                metadata,
-                mtp_specret_page_table_1,
-                metadata.nsa_seqlens_expanded[: precomputed.seqlens_expanded_size],
-                bs,
-            )
-
         self.forward_metadata = metadata
 
     def forward_extend(
