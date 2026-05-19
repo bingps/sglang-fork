@@ -511,8 +511,8 @@ class Indexer(MultiPlatformOp):
                 [:, 0]
                 .contiguous()
             )
-            if layer_id == 0:
-                print(f"{get_attention_tp_rank()=} {q_fp8.shape=} {q_mtp.shape=}")
+            # if layer_id == 0:
+            #     print(f"{get_attention_tp_rank()=} {q_fp8.shape=} {q_mtp.shape=}")
             weights_mtp = (
                 weights[:q_offset]
                 .reshape(mtp_q_num, draft_token_num, weights.shape[1])

@@ -437,7 +437,7 @@ class NativeSparseAttnBackend(
             self.enable_specret
             and is_cuda()
             and forward_mode.is_target_verify()
-            and self.mtp_specret_num_steps > 1
+            and self.mtp_specret_num_steps > 0
             and self.topk == 1
             and (self.speculative_num_draft_tokens or 0) > 1
         )
