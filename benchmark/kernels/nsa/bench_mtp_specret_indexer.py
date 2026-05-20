@@ -291,6 +291,12 @@ def _make_nsa_metadata_baseline(t: BenchTensors) -> NSAMetadata:
 def _make_nsa_metadata_specret(t: BenchTensors) -> NSAMetadata:
     """NSAMetadata with all mtp_specret_* fields populated."""
     base = _make_nsa_metadata_baseline(t)
+    # Precompute the schedule metadata (required by _get_topk_paged specret path).
+    seqlens_2d = t.mtp_specret_seqlens.unsqueeze(-1)
+    sm_count = deep_gemm.get_num_sms()
+    mtp_schedule = deep_gemm.get_paged_mqa_logits_metadata(
+        seqlens_2d, PAGE_SIZE, sm_count
+    )
     return dataclasses.replace(
         base,
         mtp_specret_enabled=True,
@@ -302,6 +308,7 @@ def _make_nsa_metadata_specret(t: BenchTensors) -> NSAMetadata:
         mtp_specret_sibling_self_page_indices=t.mtp_specret_sibling_self_page_indices,
         mtp_specret_sibling_self_logical_indices=t.mtp_specret_sibling_self_page_indices,
         mtp_specret_first_token_indices=t.mtp_specret_first_token_indices,
+        mtp_specret_paged_mqa_schedule_metadata=mtp_schedule,
     )
 
 
@@ -311,7 +318,7 @@ def _wrap_indexer_metadata(
     return NSAIndexerMetadata(
         attn_metadata=attn_meta,
         topk_transform_method=TopkTransformMethod.PAGED,
-        paged_mqa_schedule_metadata=None,  # forces deep_gemm scheduler call
+        paged_mqa_schedule_metadata=None,
         enable_mtp_specret=enable_specret,
         mtp_specret_draft_token_num=draft_token_num if enable_specret else 0,
         force_unfused_topk=False,
@@ -395,7 +402,6 @@ def _profile_specret_breakdown(
     When pre_sliced=False, uses q/weights with B*d rows (old path with reshape).
     """
     page_size = fb.token_to_kv_pool.page_size
-    blocksize = page_size
     block_kv = 64
     num_heads_kv = 1
     head_dim_with_sf = 132
@@ -418,11 +424,10 @@ def _profile_specret_breakdown(
             "3_q_slice_noop",          # just q[:mtp_q_num], no copy
             "4_weights_slice_noop",    # just w[:mtp_q_num], no copy
             "5_seqlens_unsqueeze",
-            "6_get_paged_mqa_schedule",
-            "7_fp8_paged_mqa_logits",
-            "8_topk_transform",
-            "9_repeat_interleave",
-            "10_sibling_self_kv_patch",
+            "6_fp8_paged_mqa_logits",
+            "7_topk_transform",
+            "8_repeat_interleave",
+            "9_sibling_self_kv_patch",
         ]
     else:
         q_input = t.q_specret       # (B*d, H, D)
@@ -434,11 +439,10 @@ def _profile_specret_breakdown(
             "3_q_mtp_reshape_contig",
             "4_weights_mtp_reshape_contig",
             "5_seqlens_unsqueeze",
-            "6_get_paged_mqa_schedule",
-            "7_fp8_paged_mqa_logits",
-            "8_topk_transform",
-            "9_repeat_interleave",
-            "10_sibling_self_kv_patch",
+            "6_fp8_paged_mqa_logits",
+            "7_topk_transform",
+            "8_repeat_interleave",
+            "9_sibling_self_kv_patch",
         ]
 
     def one_run(record: bool):
@@ -495,14 +499,8 @@ def _profile_specret_breakdown(
         if record:
             evs.append(torch.cuda.Event(enable_timing=True)); evs[-1].record()
 
-        # 6: schedule metadata
-        mtp_schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
-            seqlens_mtp_2d, blocksize, indexer.sm_count
-        )
-        if record:
-            evs.append(torch.cuda.Event(enable_timing=True)); evs[-1].record()
-
-        # 7: fp8_paged_mqa_logits
+        # 6: fp8_paged_mqa_logits (schedule is precomputed)
+        mtp_schedule_metadata = attn_metadata.mtp_specret_paged_mqa_schedule_metadata
         logits = deep_gemm.fp8_paged_mqa_logits(
             q_mtp,
             kv_cache_fp8,
@@ -516,7 +514,7 @@ def _profile_specret_breakdown(
         if record:
             evs.append(torch.cuda.Event(enable_timing=True)); evs[-1].record()
 
-        # 8: topk_transform
+        # 7: topk_transform
         topk_mtp = meta.topk_transform(
             logits,
             indexer.index_topk,
@@ -527,12 +525,12 @@ def _profile_specret_breakdown(
         if record:
             evs.append(torch.cuda.Event(enable_timing=True)); evs[-1].record()
 
-        # 9: repeat_interleave
+        # 8: repeat_interleave
         topk_result = topk_mtp.repeat_interleave(draft_token_num, dim=0)
         if record:
             evs.append(torch.cuda.Event(enable_timing=True)); evs[-1].record()
 
-        # 10: sibling self-kv patch
+        # 9: sibling self-kv patch
         topk_result = indexer._patch_mtp_specret_sibling_self_kv(
             topk_result, meta, draft_token_num, q_offset
         )

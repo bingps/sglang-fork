@@ -521,10 +521,6 @@ class Indexer(MultiPlatformOp):
                     .contiguous()
                 )
             seqlens_mtp_2d = mtp_seqlens.unsqueeze(-1)
-            if mtp_schedule_metadata is None:
-                mtp_schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
-                    seqlens_mtp_2d, blocksize, self.sm_count
-                )
 
             logits = deep_gemm.fp8_paged_mqa_logits(
                 q_mtp,
