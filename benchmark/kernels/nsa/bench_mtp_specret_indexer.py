@@ -18,11 +18,12 @@ production:
   5. (specret only) sibling-self-KV patch
        -> Indexer._patch_mtp_specret_sibling_self_kv
 
-Because we want to isolate the kernel cost without spinning up a full
-ModelRunner, we construct the real NSAMetadata / NSAIndexerMetadata dataclasses
-with synthetic tensors, and provide tiny duck-typed stubs for `forward_batch`
-and `token_to_kv_pool`. The Indexer instance itself is built via __new__ so we
-do not run its (expensive, weight-allocating) __init__.
+Three paths are benchmarked:
+  - baseline:         enable_mtp_specret=False, q/weights have B*d rows
+  - specret:          enable_mtp_specret=True, q/weights have B*d rows
+                      (_get_topk_paged reshapes+contiguous internally)
+  - specret_preslice: enable_mtp_specret=True, q/weights pre-sliced to B rows
+                      (_get_topk_paged skips reshape+contiguous)
 
 Usage:
     source .venv/bin/activate
@@ -118,15 +119,22 @@ class BenchTensors:
     page_table_1_baseline: torch.Tensor     # [B*d, max_seq_len] int32 (page1)
     cu_seqlens_q_baseline: torch.Tensor     # [B*d + 1] int32
 
-    # ---- specret ----
-    q_specret: torch.Tensor                 # [B*d, H, D] fp8 (full input; specret slices internally)
-    weights_specret: torch.Tensor           # [B*d, H, 1] fp32 (full input)
+    # ---- specret (full B*d input, reshapes internally) ----
+    q_specret: torch.Tensor             # [B*d, H, D] fp8
+    weights_specret: torch.Tensor       # [B*d, H, 1] fp32
+
+    # ---- specret preslice (pre-sliced B rows) ----
+    q_specret_preslice: torch.Tensor             # [B, H, D] fp8 (first token only)
+    weights_specret_preslice: torch.Tensor       # [B, H, 1] fp32 (first token only)
+
+    # ---- specret shared metadata ----
     mtp_specret_seqlens: torch.Tensor       # [B] int32
     mtp_specret_real_page_table: torch.Tensor   # [B, max_blocks] int32
     mtp_specret_page_table_1: torch.Tensor      # [B, max_seq_len] int32
     mtp_specret_cu_seqlens_q: torch.Tensor      # [B + 1] int32
     mtp_specret_sibling_rows: torch.Tensor      # [B*(d-1)] int64
     mtp_specret_sibling_self_page_indices: torch.Tensor  # [B*(d-1)] int32
+    mtp_specret_first_token_indices: torch.Tensor  # [B] int64
 
     # ---- shape book-keeping ----
     batch_size: int
@@ -164,6 +172,13 @@ def _build_inputs(
         total_q, num_heads, 1, generator=g, device=device, dtype=torch.float32
     )
 
+    # Pre-sliced first-token tensors for the new specret path
+    first_idx = torch.arange(
+        0, total_q, draft_token_num, device=device, dtype=torch.int64
+    )
+    q_specret_preslice = q_fp8[first_idx].contiguous()       # (B, H, D)
+    weights_specret_preslice = weights[first_idx].contiguous()  # (B, H, 1)
+
     # Packed fp8 + per-block scales kv-cache buffer, exposed as 2D uint8 to
     # match NSATokenToKVPool.get_index_k_with_scale_buffer's contract.
     num_pages = batch_size * max_blocks + 1  # +1 because page id 0 is unused
@@ -188,8 +203,6 @@ def _build_inputs(
     )
 
     # ---- page-1 page tables ----
-    # Real NSA stores a (Batch, max_seq_len_k) int32 mapping logical token
-    # positions to physical KV slots. arange per row is sufficient for timing.
     page_table_1_specret = torch.arange(
         0, max_seq_len, dtype=torch.int32, device=device
     ).unsqueeze(0).expand(batch_size, -1).contiguous()
@@ -198,8 +211,6 @@ def _build_inputs(
     ).unsqueeze(0).expand(total_q, -1).contiguous()
 
     # ---- seqlens ----
-    # In real target-verify, the i-th sibling sees seq_len + i tokens; the
-    # difference is irrelevant for timing, so reuse one value.
     seqlens_expanded_baseline = torch.full(
         (total_q,), seq_len, dtype=torch.int32, device=device
     )
@@ -208,8 +219,6 @@ def _build_inputs(
     )
 
     # ---- cu_seqlens_q ----
-    # In paged decode/target-verify each q row is one token, so cu_seqlens_q
-    # is just arange(N+1).
     cu_seqlens_q_baseline = torch.arange(
         0, total_q + 1, dtype=torch.int32, device=device
     )
@@ -218,8 +227,6 @@ def _build_inputs(
     )
 
     # ---- sibling-self-kv patch metadata ----
-    # For each batch b, sibling rows are b*d + 1, ..., b*d + (d-1).
-    # (Position 0 of each draft group has no sibling-self-kv.)
     base = torch.arange(batch_size, device=device, dtype=torch.int64) * draft_token_num
     sibling_offsets = torch.arange(
         1, draft_token_num, device=device, dtype=torch.int64
@@ -240,12 +247,15 @@ def _build_inputs(
         cu_seqlens_q_baseline=cu_seqlens_q_baseline,
         q_specret=q_fp8,
         weights_specret=weights,
+        q_specret_preslice=q_specret_preslice,
+        weights_specret_preslice=weights_specret_preslice,
         mtp_specret_seqlens=mtp_specret_seqlens,
         mtp_specret_real_page_table=block_tables_per_batch,
         mtp_specret_page_table_1=page_table_1_specret,
         mtp_specret_cu_seqlens_q=mtp_specret_cu_seqlens_q,
         mtp_specret_sibling_rows=sibling_rows,
         mtp_specret_sibling_self_page_indices=sibling_self_page_indices,
+        mtp_specret_first_token_indices=first_idx,
         batch_size=batch_size,
         draft_token_num=draft_token_num,
     )
@@ -289,10 +299,9 @@ def _make_nsa_metadata_specret(t: BenchTensors) -> NSAMetadata:
         mtp_specret_seqlens=t.mtp_specret_seqlens,
         mtp_specret_cu_seqlens_q=t.mtp_specret_cu_seqlens_q,
         mtp_specret_sibling_rows=t.mtp_specret_sibling_rows,
-        # _patch_mtp_specret_sibling_self_kv picks page_indices when
-        # SGLANG_NSA_FUSE_TOPK is True (default), else logical_indices.
         mtp_specret_sibling_self_page_indices=t.mtp_specret_sibling_self_page_indices,
         mtp_specret_sibling_self_logical_indices=t.mtp_specret_sibling_self_page_indices,
+        mtp_specret_first_token_indices=t.mtp_specret_first_token_indices,
     )
 
 
@@ -358,15 +367,14 @@ def _summarize(label: str, samples_ms: List[float]) -> Tuple[float, float, float
     mean = statistics.fmean(samples_ms_sorted)
     p10 = samples_ms_sorted[int(0.1 * len(samples_ms_sorted))]
     print(
-        f"  {label:<10s}  median={median:8.4f} ms  mean={mean:8.4f} ms  "
+        f"  {label:<14s}  median={median:8.4f} ms  mean={mean:8.4f} ms  "
         f"min={samples_ms_sorted[0]:8.4f} ms  p10={p10:8.4f} ms"
     )
     return median, mean, samples_ms_sorted[0]
 
 
 # ---------------------------------------------------------------------------
-# Per-step profiling: open-coded mirror of Indexer._get_topk_paged so we can
-# wrap each operator with CUDA events and attribute the overhead.
+# Per-step profiling for specret paths
 # ---------------------------------------------------------------------------
 
 
@@ -376,36 +384,21 @@ def _profile_specret_breakdown(
     t: "BenchTensors",
     meta: "NSAIndexerMetadata",
     *,
+    pre_sliced: bool,
     warmup: int,
     iters: int,
     device: torch.device,
 ) -> None:
     """Run the specret path step-by-step with CUDA events to attribute overhead.
 
-    Mirrors lines 444-548 of Indexer._get_topk_paged in nsa_indexer.py, but
-    inserts a torch.cuda.Event before/after each named step. Reports the
-    median latency of each step over `iters` runs.
+    When pre_sliced=True, uses q/weights with B rows (new path).
+    When pre_sliced=False, uses q/weights with B*d rows (old path with reshape).
     """
     page_size = fb.token_to_kv_pool.page_size
     blocksize = page_size
     block_kv = 64
     num_heads_kv = 1
     head_dim_with_sf = 132
-
-    # Steps we time. Order matches _get_topk_paged.
-    step_names = [
-        "0_prep_kv_cache_view",
-        "1_q_unsqueeze",
-        "2_weights_squeeze",
-        "3_q_mtp_reshape_contig",      # specret-only
-        "4_weights_mtp_reshape_contig",  # specret-only
-        "5_seqlens_unsqueeze",
-        "6_get_paged_mqa_schedule",    # specret-only here (no precompute)
-        "7_fp8_paged_mqa_logits",
-        "8_topk_transform",
-        "9_repeat_interleave",         # specret-only
-        "10_sibling_self_kv_patch",    # specret-only
-    ]
 
     attn_metadata = meta.attn_metadata
     draft_token_num = meta.mtp_specret_draft_token_num
@@ -414,6 +407,39 @@ def _profile_specret_breakdown(
 
     kv_cache_fp8_2d = fb.token_to_kv_pool.get_index_k_with_scale_buffer(layer_id=0)
     max_seq_len = attn_metadata.mtp_specret_real_page_table.shape[1] * page_size
+
+    if pre_sliced:
+        q_input = t.q_specret_preslice       # (B, H, D)
+        w_input = t.weights_specret_preslice  # (B, H, 1)
+        step_names = [
+            "0_prep_kv_cache_view",
+            "1_q_unsqueeze",
+            "2_weights_squeeze",
+            "3_q_slice_noop",          # just q[:mtp_q_num], no copy
+            "4_weights_slice_noop",    # just w[:mtp_q_num], no copy
+            "5_seqlens_unsqueeze",
+            "6_get_paged_mqa_schedule",
+            "7_fp8_paged_mqa_logits",
+            "8_topk_transform",
+            "9_repeat_interleave",
+            "10_sibling_self_kv_patch",
+        ]
+    else:
+        q_input = t.q_specret       # (B*d, H, D)
+        w_input = t.weights_specret  # (B*d, H, 1)
+        step_names = [
+            "0_prep_kv_cache_view",
+            "1_q_unsqueeze",
+            "2_weights_squeeze",
+            "3_q_mtp_reshape_contig",
+            "4_weights_mtp_reshape_contig",
+            "5_seqlens_unsqueeze",
+            "6_get_paged_mqa_schedule",
+            "7_fp8_paged_mqa_logits",
+            "8_topk_transform",
+            "9_repeat_interleave",
+            "10_sibling_self_kv_patch",
+        ]
 
     def one_run(record: bool):
         evs = []
@@ -429,33 +455,40 @@ def _profile_specret_breakdown(
             evs.append(torch.cuda.Event(enable_timing=True)); evs[-1].record()
 
         # 1: q unsqueeze (next_n dim)
-        q_fp8_3d = t.q_specret  # already (N, H, D)
-        q_fp8 = q_fp8_3d.unsqueeze(1)  # (N, 1, H, D)
+        q_fp8 = q_input.unsqueeze(1)
         if record:
             evs.append(torch.cuda.Event(enable_timing=True)); evs[-1].record()
 
         # 2: weights squeeze
-        w = t.weights_specret.squeeze(2)  # (N, H)
+        w = w_input.squeeze(2)
         if record:
             evs.append(torch.cuda.Event(enable_timing=True)); evs[-1].record()
 
-        # 3: q_mtp reshape + contiguous
-        q_mtp = (
-            q_fp8[:q_offset]
-            .reshape(mtp_q_num, draft_token_num, *q_fp8.shape[1:])[:, 0]
-            .contiguous()
-        )
-        if record:
-            evs.append(torch.cuda.Event(enable_timing=True)); evs[-1].record()
-
-        # 4: weights_mtp reshape + contiguous
-        weights_mtp = (
-            w[:q_offset]
-            .reshape(mtp_q_num, draft_token_num, w.shape[1])[:, 0]
-            .contiguous()
-        )
-        if record:
-            evs.append(torch.cuda.Event(enable_timing=True)); evs[-1].record()
+        # 3 & 4: reshape+contiguous (old) or no-op slice (new)
+        if pre_sliced:
+            # New path: q_fp8.shape[0] == mtp_q_num, so just slice (no copy)
+            q_mtp = q_fp8[:mtp_q_num]
+            if record:
+                evs.append(torch.cuda.Event(enable_timing=True)); evs[-1].record()
+            weights_mtp = w[:mtp_q_num]
+            if record:
+                evs.append(torch.cuda.Event(enable_timing=True)); evs[-1].record()
+        else:
+            # Old path: reshape + contiguous
+            q_mtp = (
+                q_fp8[:q_offset]
+                .reshape(mtp_q_num, draft_token_num, *q_fp8.shape[1:])[:, 0]
+                .contiguous()
+            )
+            if record:
+                evs.append(torch.cuda.Event(enable_timing=True)); evs[-1].record()
+            weights_mtp = (
+                w[:q_offset]
+                .reshape(mtp_q_num, draft_token_num, w.shape[1])[:, 0]
+                .contiguous()
+            )
+            if record:
+                evs.append(torch.cuda.Event(enable_timing=True)); evs[-1].record()
 
         # 5: seqlens unsqueeze
         seqlens_mtp_2d = attn_metadata.mtp_specret_seqlens.unsqueeze(-1)
@@ -522,7 +555,8 @@ def _profile_specret_breakdown(
             per_step[i].append(evs[i].elapsed_time(evs[i + 1]))
 
     # Report
-    print("  -- specret per-step breakdown (median ms) --")
+    label = "pre-slice" if pre_sliced else "old (reshape)"
+    print(f"  -- specret per-step breakdown [{label}] (median ms) --")
     total = 0.0
     for name, samples in zip(step_names, per_step):
         m = statistics.median(samples)
@@ -572,7 +606,7 @@ def main() -> None:
     parser.add_argument(
         "--profile",
         action="store_true",
-        help="Print a per-step CUDA-event breakdown of the specret path.",
+        help="Print a per-step CUDA-event breakdown of both specret paths.",
     )
     args = parser.parse_args()
 
@@ -598,9 +632,10 @@ def main() -> None:
         f"warmup={args.warmup}, iters={args.iters})"
     )
     print(
-        "Calls Indexer._get_topk_paged directly: "
-        "deep_gemm.get_paged_mqa_logits_metadata + fp8_paged_mqa_logits + "
-        "topk_transform (+ repeat_interleave + sibling-patch for specret)"
+        "Calls Indexer._get_topk_paged directly.\n"
+        "  baseline:         specret=off, q/weights = B*d rows\n"
+        "  specret:          specret=on,  q/weights = B*d rows (reshape+contiguous)\n"
+        "  specret_preslice: specret=on,  q/weights = B   rows (pre-sliced, no copy)"
     )
     print("=" * 96)
 
@@ -638,10 +673,16 @@ def main() -> None:
                         fb, 0, t.q_specret, t.weights_specret, meta_specret
                     )
 
+                def specret_preslice_fn():
+                    return indexer._get_topk_paged(
+                        fb, 0, t.q_specret_preslice, t.weights_specret_preslice, meta_specret
+                    )
+
                 # Sanity: shapes match
                 with torch.inference_mode():
                     out_b = baseline_fn()
                     out_s = specret_fn()
+                    out_sp = specret_preslice_fn()
                 expected_rows = B * d
                 assert out_b.shape[0] >= expected_rows, (
                     f"unexpected baseline rows: {out_b.shape}"
@@ -649,11 +690,16 @@ def main() -> None:
                 assert out_s.shape[0] >= expected_rows, (
                     f"unexpected specret rows: {out_s.shape}"
                 )
-                assert out_b.shape[1] == out_s.shape[1] == INDEX_TOPK
+                assert out_sp.shape[0] >= expected_rows, (
+                    f"unexpected specret_preslice rows: {out_sp.shape}"
+                )
+                assert (
+                    out_b.shape[1] == out_s.shape[1] == out_sp.shape[1] == INDEX_TOPK
+                )
 
                 print(
                     f"B={B}  S={S}  d={d}  "
-                    f"(q rows: total={B * d}, specret-internal={B})"
+                    f"(q rows: baseline={B * d}, specret={B * d}, specret_preslice={B})"
                 )
                 baseline_samples = _bench(
                     baseline_fn, warmup=args.warmup, iters=args.iters, device=device
@@ -661,22 +707,30 @@ def main() -> None:
                 specret_samples = _bench(
                     specret_fn, warmup=args.warmup, iters=args.iters, device=device
                 )
+                specret_preslice_samples = _bench(
+                    specret_preslice_fn, warmup=args.warmup, iters=args.iters, device=device
+                )
                 b_med, _, _ = _summarize("baseline", baseline_samples)
                 s_med, _, _ = _summarize("specret", specret_samples)
+                sp_med, _, _ = _summarize("specret_preslice", specret_preslice_samples)
                 print(
-                    f"  speedup (median) = {b_med / s_med:.3f}x  "
-                    f"(ideal upper bound ~ {d}x for the logits step)\n"
+                    f"  speedup vs baseline:  "
+                    f"specret={b_med / s_med:.3f}x  pre-slice={b_med / sp_med:.3f}x  "
+                    f"(ideal ~ {d}x)"
                 )
+                print()
 
                 if args.profile:
                     _profile_specret_breakdown(
-                        indexer,
-                        fb,
-                        t,
-                        meta_specret,
-                        warmup=args.warmup,
-                        iters=args.iters,
-                        device=device,
+                        indexer, fb, t, meta_specret,
+                        pre_sliced=False,
+                        warmup=args.warmup, iters=args.iters, device=device,
+                    )
+                    print()
+                    _profile_specret_breakdown(
+                        indexer, fb, t, meta_specret,
+                        pre_sliced=True,
+                        warmup=args.warmup, iters=args.iters, device=device,
                     )
                     print()
 

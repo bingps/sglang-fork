@@ -502,18 +502,24 @@ class Indexer(MultiPlatformOp):
                 attn_metadata.mtp_specret_paged_mqa_schedule_metadata
             )
 
-            q_mtp = (
-                q_fp8[:q_offset]
-                .reshape(mtp_q_num, draft_token_num, *q_fp8.shape[1:])
-                [:, 0]
-                .contiguous()
-            )
-            weights_mtp = (
-                weights[:q_offset]
-                .reshape(mtp_q_num, draft_token_num, weights.shape[1])
-                [:, 0]
-                .contiguous()
-            )
+            # When the upstream caller already passed only first-token q/weights
+            # (shape[0] == mtp_q_num), skip the expensive reshape+contiguous.
+            if q_fp8.shape[0] == mtp_q_num:
+                q_mtp = q_fp8[:mtp_q_num]
+                weights_mtp = weights[:mtp_q_num]
+            else:
+                q_mtp = (
+                    q_fp8[:q_offset]
+                    .reshape(mtp_q_num, draft_token_num, *q_fp8.shape[1:])
+                    [:, 0]
+                    .contiguous()
+                )
+                weights_mtp = (
+                    weights[:q_offset]
+                    .reshape(mtp_q_num, draft_token_num, weights.shape[1])
+                    [:, 0]
+                    .contiguous()
+                )
             seqlens_mtp_2d = mtp_seqlens.unsqueeze(-1)
             if mtp_schedule_metadata is None:
                 mtp_schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
@@ -1224,7 +1230,80 @@ class Indexer(MultiPlatformOp):
                 ),
             )
 
-        if enable_dual_stream and forward_batch.forward_mode.is_decode_or_idle():
+        # MTP specret fast path: only compute q/weights for the first draft
+        # token of each request, store keys for all tokens.  This avoids the
+        # expensive reshape+contiguous that the generic path performs inside
+        # _get_topk_paged to extract the first-token subset.
+        use_mtp_specret = getattr(metadata, "enable_mtp_specret", False)
+        if use_mtp_specret and _is_cuda:
+            first_idx = metadata.attn_metadata.mtp_specret_first_token_indices
+            # Key: compute for ALL tokens (needed for KV cache store)
+            key = self._get_k_bf16(x, positions, enable_dual_stream=False)
+            self._store_index_k_cache(
+                forward_batch=forward_batch,
+                layer_id=layer_id,
+                key=key,
+                act_quant=act_quant,
+            )
+            # Query + weights: only for first token of each draft group (B rows)
+            q_lora_first = q_lora[first_idx]
+            x_first = x[first_idx] if not isinstance(x, tuple) else tuple(
+                t[first_idx] if t is not None else None for t in x
+            )
+            positions_first = positions[first_idx]
+            query_first, _ = self.wq_b(q_lora_first)
+            query_first = rearrange(
+                query_first, "l (h d) -> l h d", d=self.head_dim
+            )
+            q_rope_first, _ = torch.split(
+                query_first,
+                [self.rope_head_dim, self.head_dim - self.rope_head_dim],
+                dim=-1,
+            )
+            # RoPE on the first-token q only (k not needed since we already
+            # stored all keys above via _get_k_bf16 which does its own RoPE).
+            q_rope_first, _ = self.rotary_emb(
+                positions_first, q_rope_first, q_rope_first
+            )
+            self._update_rope_guarded(
+                query_first[..., : self.rope_head_dim], q_rope_first
+            )
+            query_first = rotate_activation(query_first)
+            q_fp8_first, q_scale_first = act_quant(
+                query_first, self.block_size, self.scale_fmt
+            )
+            # x_for_gate for first tokens
+            if isinstance(x, tuple):
+                x_q, x_s = x[0], x[1]
+                if (
+                    x_s is not None
+                    and x_q.dim() == 2
+                    and x_s.dim() == 2
+                    and x_q.shape[0] == x_s.shape[0]
+                ):
+                    m, n = x_q.shape
+                    ng = x_s.shape[1]
+                    if ng > 0 and n % ng == 0:
+                        group = n // ng
+                        x_for_gate_first = (
+                            x_q[first_idx]
+                            .to(torch.float32)
+                            .view(-1, ng, group)
+                            .mul_(x_s[first_idx].to(torch.float32).unsqueeze(-1))
+                            .view(-1, n)
+                            .to(torch.bfloat16)
+                        )
+                    else:
+                        x_for_gate_first = x_q[first_idx].to(torch.bfloat16)
+                else:
+                    x_for_gate_first = x_q[first_idx].to(torch.bfloat16)
+            else:
+                x_for_gate_first = x_first
+            weights = self._get_logits_head_gate(x_for_gate_first, q_scale_first)
+            # q_fp8_first is already (B, H, D), contiguous — pass directly.
+            # _get_topk_paged will use it with the specret metadata (B rows).
+            q_fp8 = q_fp8_first
+        elif enable_dual_stream and forward_batch.forward_mode.is_decode_or_idle():
             current_stream = torch.cuda.current_stream()
             self.alt_stream.wait_stream(current_stream)
             weights = self._project_and_scale_head_gates(x)

@@ -151,6 +151,10 @@ class NSAMetadata:
     mtp_specret_sibling_rows: Optional[torch.Tensor] = None
     mtp_specret_sibling_self_logical_indices: Optional[torch.Tensor] = None
     mtp_specret_sibling_self_page_indices: Optional[torch.Tensor] = None
+    # Indices of the first draft token of each request: [0, d, 2d, ..., (B-1)*d].
+    # Used to slice q_lora/x/positions upstream so we only compute q/weights for
+    # the representative token (avoiding expensive reshape+contiguous in _get_topk_paged).
+    mtp_specret_first_token_indices: Optional[torch.Tensor] = None
     # The sum of sequence lengths for key, prefill only
     seq_lens_sum: Optional[int] = None
     # The flattened 1D page table with shape (seq_lens_sum,), prefill only
@@ -500,6 +504,20 @@ class NativeSparseAttnBackend(
             seqlens_expanded, batch_size
         )
         q_offset = batch_size * self.speculative_num_draft_tokens
+
+        # Pre-compute first-token indices [0, d, 2d, ..., (B-1)*d] for upstream
+        # slicing of q_lora/x/positions.
+        first_indices = torch.arange(
+            0, q_offset, self.speculative_num_draft_tokens,
+            device=self.device, dtype=torch.int64,
+        )
+        if metadata.mtp_specret_first_token_indices is None:
+            object.__setattr__(
+                metadata, "mtp_specret_first_token_indices", first_indices
+            )
+        else:
+            metadata.mtp_specret_first_token_indices.copy_(first_indices)
+
         row_ids = torch.arange(q_offset, device=self.device, dtype=torch.int64)
         sibling_rows = row_ids[row_ids.remainder(self.speculative_num_draft_tokens) > 0]
         sibling_logical_indices = (
@@ -1222,6 +1240,14 @@ class NativeSparseAttnBackend(
                 "mtp_specret_sibling_self_page_indices",
                 torch.zeros(
                     sibling_rows.shape[0], dtype=torch.int32, device=self.device
+                ),
+            )
+            object.__setattr__(
+                metadata,
+                "mtp_specret_first_token_indices",
+                torch.arange(
+                    0, q_offset, self.speculative_num_draft_tokens,
+                    device=self.device, dtype=torch.int64,
                 ),
             )
             dummy_schedule = self._compute_paged_mqa_schedule_metadata(
