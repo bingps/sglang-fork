@@ -65,6 +65,32 @@ def _analyze_payload(payload: dict) -> dict:
     return stats
 
 
+def _collect_vs_draft0(payload: dict) -> list[tuple[int, float, float]]:
+    """For each (draft_idx, overlap_ratio_vs_draft0, jaccard_vs_draft0) within
+    each request in the payload, return a flat list."""
+    topk = payload["topk"].to(torch.int64).tolist()
+    extend_lens = payload.get("extend_seq_lens") or [len(topk)]
+    out: list[tuple[int, float, float]] = []
+
+    offset = 0
+    for req_len in extend_lens:
+        req_len = int(req_len)
+        rows = topk[offset : offset + req_len]
+        offset += req_len
+        if not rows:
+            continue
+        base = _valid_set(rows[0])
+        for i, row in enumerate(rows):
+            cur = _valid_set(row)
+            inter = len(base & cur)
+            union = len(base | cur)
+            denom = min(len(base), len(cur))
+            ratio = inter / denom if denom else 0.0
+            jacc = inter / union if union else 0.0
+            out.append((i, ratio, jacc))
+    return out
+
+
 def _merge_stats(dst: dict, src: dict) -> None:
     dst["pairs"] += src["pairs"]
     dst["exact_matches"] += src["exact_matches"]
@@ -96,6 +122,73 @@ def _summarize(stats: dict) -> dict:
     }
 
 
+def _plot_heatmap(
+    matrix,
+    layers: list[int],
+    num_draft: int,
+    output_path: Path,
+    title: str,
+    value_fmt: str = "{:.2f}",
+) -> None:
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    arr = np.asarray(matrix, dtype=float)  # shape (num_draft, num_layers)
+    # drop the meaningless draft0 vs draft0 row (always 1.0)
+    if num_draft > 1:
+        arr = arr[1:, :]
+        row_labels = [f"draft{i} vs draft0" for i in range(1, num_draft)]
+    else:
+        row_labels = [f"draft{i} vs draft0" for i in range(num_draft)]
+    rows = arr.shape[0]
+
+    # split layers into two halves for an upper/lower subplot layout
+    mid = (len(layers) + 1) // 2
+    splits = [(0, mid), (mid, len(layers))]
+
+    max_cols = max(end - start for start, end in splits) or 1
+    fig_w = max(8.0, 0.32 * max_cols + 2)
+    fig_h = max(3.5, 0.55 * rows * len(splits) + 2.0)
+    fig, axes = plt.subplots(len(splits), 1, figsize=(fig_w, fig_h))
+    if len(splits) == 1:
+        axes = [axes]
+
+    im = None
+    for ax, (start, end) in zip(axes, splits):
+        sub = arr[:, start:end]
+        sub_layers = layers[start:end]
+        im = ax.imshow(sub, aspect="auto", cmap="viridis", vmin=0.0, vmax=1.0)
+        ax.set_xticks(range(len(sub_layers)))
+        ax.set_xticklabels([str(l) for l in sub_layers], rotation=90, fontsize=8)
+        ax.set_yticks(range(rows))
+        ax.set_yticklabels(row_labels)
+        ax.set_xlabel("layer_id")
+        ax.set_ylabel("draft index")
+        ax.set_title(f"layers {sub_layers[0]}..{sub_layers[-1]}")
+
+        if sub.shape[1] <= 80:
+            for i in range(sub.shape[0]):
+                for j in range(sub.shape[1]):
+                    v = sub[i, j]
+                    if not np.isnan(v):
+                        ax.text(
+                            j,
+                            i,
+                            value_fmt.format(v),
+                            ha="center",
+                            va="center",
+                            color="white" if v < 0.5 else "black",
+                            fontsize=7,
+                        )
+
+    fig.subplots_adjust(hspace=0.6, top=0.92)
+    fig.savefig(output_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Analyze adjacent draft-token top-k overlap from NSA dump files."
@@ -110,11 +203,24 @@ def main() -> None:
         action="store_true",
         help="Print machine-readable JSON instead of a text summary.",
     )
+    parser.add_argument(
+        "--heatmap",
+        type=str,
+        default=None,
+        help="Output path prefix for the (num_draft x num_layer) heatmap PNG. "
+        "If a directory is provided, files 'overlap_ratio.png' and 'jaccard.png' "
+        "are written inside it. Defaults to '<inputs[0]>/heatmap_overlap_ratio.png' "
+        "and '<inputs[0]>/heatmap_jaccard.png' when omitted.",
+    )
     args = parser.parse_args()
 
     paths = _iter_dump_paths(args.inputs)
     by_layer: dict[int, dict] = defaultdict(_empty_stats)
     overall = _empty_stats()
+
+    # heatmap accumulators: (layer_id, draft_idx) -> list[ratio], list[jaccard]
+    hm_ratio: dict[tuple[int, int], list[float]] = defaultdict(list)
+    hm_jacc: dict[tuple[int, int], list[float]] = defaultdict(list)
 
     for path in paths:
         payload = torch.load(path, map_location="cpu")
@@ -125,6 +231,10 @@ def main() -> None:
         by_layer[layer_id]["files"] += 1
         _merge_stats(overall, stats)
         overall["files"] += 1
+
+        for draft_idx, ratio, jacc in _collect_vs_draft0(payload):
+            hm_ratio[(layer_id, draft_idx)].append(ratio)
+            hm_jacc[(layer_id, draft_idx)].append(jacc)
 
     result = {
         "num_files": len(paths),
@@ -137,14 +247,56 @@ def main() -> None:
 
     if args.json:
         print(json.dumps(result, indent=2, sort_keys=True))
-        return
+    else:
+        print(f"Loaded files: {result['num_files']}")
+        print("Overall:")
+        print(json.dumps(result["overall"], indent=2, sort_keys=True))
+        print("By layer:")
+        for layer_id, summary in result["by_layer"].items():
+            print(f"Layer {layer_id}: {json.dumps(summary, sort_keys=True)}")
 
-    print(f"Loaded files: {result['num_files']}")
-    print("Overall:")
-    print(json.dumps(result["overall"], indent=2, sort_keys=True))
-    print("By layer:")
-    for layer_id, summary in result["by_layer"].items():
-        print(f"Layer {layer_id}: {json.dumps(summary, sort_keys=True)}")
+    # build heatmap matrix
+    if hm_ratio:
+        layers = sorted({lid for lid, _ in hm_ratio.keys()})
+        num_draft = max(d for _, d in hm_ratio.keys()) + 1
+        ratio_mat = [[float("nan")] * len(layers) for _ in range(num_draft)]
+        jacc_mat = [[float("nan")] * len(layers) for _ in range(num_draft)]
+        for (lid, didx), vs in hm_ratio.items():
+            ratio_mat[didx][layers.index(lid)] = mean(vs)
+        for (lid, didx), vs in hm_jacc.items():
+            jacc_mat[didx][layers.index(lid)] = mean(vs)
+
+        out_arg = args.heatmap
+        if out_arg is None:
+            base_dir = Path(args.inputs[0])
+            base_dir = base_dir if base_dir.is_dir() else base_dir.parent
+            ratio_path = base_dir / "heatmap_overlap_ratio.png"
+            jacc_path = base_dir / "heatmap_jaccard.png"
+        else:
+            out_path = Path(out_arg)
+            if out_path.is_dir() or out_arg.endswith("/"):
+                out_path.mkdir(parents=True, exist_ok=True)
+                ratio_path = out_path / "overlap_ratio.png"
+                jacc_path = out_path / "jaccard.png"
+            else:
+                ratio_path = out_path.with_name(out_path.stem + "_overlap_ratio.png")
+                jacc_path = out_path.with_name(out_path.stem + "_jaccard.png")
+
+        _plot_heatmap(
+            ratio_mat,
+            layers,
+            num_draft,
+            ratio_path,
+            title="Top-k overlap ratio (draft_i vs draft_0)",
+        )
+        _plot_heatmap(
+            jacc_mat,
+            layers,
+            num_draft,
+            jacc_path,
+            title="Top-k Jaccard (draft_i vs draft_0)",
+        )
+        print(f"Saved heatmaps:\n  {ratio_path}\n  {jacc_path}")
 
 
 if __name__ == "__main__":
