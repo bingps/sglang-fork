@@ -353,7 +353,11 @@ def _bench(
     warmup: int,
     iters: int,
     device: torch.device,
+    use_cuda_graph: bool = False,
 ) -> List[float]:
+    if use_cuda_graph:
+        return _bench_cuda_graph(fn, warmup=warmup, iters=iters, device=device)
+
     for _ in range(warmup):
         fn()
     torch.cuda.synchronize(device)
@@ -363,6 +367,48 @@ def _bench(
     for i in range(iters):
         starts[i].record()
         fn()
+        ends[i].record()
+    torch.cuda.synchronize(device)
+    return [s.elapsed_time(e) for s, e in zip(starts, ends)]
+
+
+def _bench_cuda_graph(
+    fn: Callable[[], torch.Tensor],
+    *,
+    warmup: int,
+    iters: int,
+    device: torch.device,
+) -> List[float]:
+    """Benchmark fn under CUDA graph capture+replay.
+
+    This reflects production target-verify decode performance where the entire
+    forward pass (including the indexer) is captured into a CUDA graph. Under
+    graph replay, per-kernel launch overhead drops from ~5-7 µs to ~0.1 µs.
+    """
+    # Warmup (eager, to trigger Triton JIT + CUDA allocator warm-up)
+    for _ in range(warmup):
+        fn()
+    torch.cuda.synchronize(device)
+
+    # Capture the graph
+    # Use a dedicated stream for capture (required by CUDA graph API)
+    stream = torch.cuda.Stream(device=device)
+    with torch.cuda.stream(stream):
+        # Warmup on the capture stream (required for consistent addresses)
+        fn()
+    stream.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        fn()
+    stream.synchronize()
+
+    # Replay and time
+    starts = [torch.cuda.Event(enable_timing=True) for _ in range(iters)]
+    ends = [torch.cuda.Event(enable_timing=True) for _ in range(iters)]
+    for i in range(iters):
+        starts[i].record()
+        graph.replay()
         ends[i].record()
     torch.cuda.synchronize(device)
     return [s.elapsed_time(e) for s, e in zip(starts, ends)]
@@ -599,6 +645,14 @@ def main() -> None:
         action="store_true",
         help="Print a per-step CUDA-event breakdown of both specret paths.",
     )
+    parser.add_argument(
+        "--cuda-graph",
+        action="store_true",
+        help=(
+            "Benchmark under CUDA graph capture+replay (production mode). "
+            "Eliminates kernel launch overhead to show pure GPU compute cost."
+        ),
+    )
     args = parser.parse_args()
 
     if not torch.cuda.is_available():
@@ -617,10 +671,11 @@ def main() -> None:
 
     indexer = _make_indexer()
 
+    mode_str = "cuda-graph" if args.cuda_graph else "eager"
     print(
         f"NSA MTP-specret indexer micro-bench  "
         f"(H={args.num_heads}, D={args.head_dim}, sm_count={indexer.sm_count}, "
-        f"warmup={args.warmup}, iters={args.iters})"
+        f"warmup={args.warmup}, iters={args.iters}, mode={mode_str})"
     )
     print(
         "Calls Indexer._get_topk_paged directly.\n"
@@ -693,13 +748,16 @@ def main() -> None:
                     f"(q rows: baseline={B * d}, specret={B * d}, specret_preslice={B})"
                 )
                 baseline_samples = _bench(
-                    baseline_fn, warmup=args.warmup, iters=args.iters, device=device
+                    baseline_fn, warmup=args.warmup, iters=args.iters,
+                    device=device, use_cuda_graph=args.cuda_graph,
                 )
                 specret_samples = _bench(
-                    specret_fn, warmup=args.warmup, iters=args.iters, device=device
+                    specret_fn, warmup=args.warmup, iters=args.iters,
+                    device=device, use_cuda_graph=args.cuda_graph,
                 )
                 specret_preslice_samples = _bench(
-                    specret_preslice_fn, warmup=args.warmup, iters=args.iters, device=device
+                    specret_preslice_fn, warmup=args.warmup, iters=args.iters,
+                    device=device, use_cuda_graph=args.cuda_graph,
                 )
                 b_med, _, _ = _summarize("baseline", baseline_samples)
                 s_med, _, _ = _summarize("specret", specret_samples)
