@@ -539,9 +539,8 @@ class Indexer(MultiPlatformOp):
                 cu_seqlens_q_topk_override=mtp_cu_seqlens_q,
                 page_table_size_1_override=mtp_page_table_1,
             )
-            topk_result = topk_mtp.repeat_interleave(draft_token_num, dim=0)
-            topk_result = self._patch_mtp_specret_sibling_self_kv(
-                topk_result, metadata, draft_token_num, q_offset
+            topk_result = self._fused_repeat_and_patch(
+                topk_mtp, metadata, draft_token_num, q_offset
             )
         elif _is_hip:
             from aiter.ops.triton.pa_mqa_logits import deepgemm_fp8_paged_mqa_logits
@@ -616,6 +615,49 @@ class Indexer(MultiPlatformOp):
 
         topk_result[sibling_rows, -1] = self_kv.to(topk_result.dtype)
         return topk_result
+
+    def _fused_repeat_and_patch(
+        self,
+        topk_mtp: torch.Tensor,
+        metadata: BaseIndexerMetadata,
+        draft_token_num: int,
+        q_offset: int,
+    ) -> torch.Tensor:
+        """Fused repeat_interleave + sibling self-KV patch (single kernel launch).
+
+        Falls back to the two-step PyTorch path when SGLANG_NSA_FUSE_REPEAT_PATCH=0.
+        """
+        attn_metadata = metadata.attn_metadata
+
+        # Determine self_kv values
+        if draft_token_num <= 1 or q_offset == 0:
+            self_kv = None
+        else:
+            sibling_rows = attn_metadata.mtp_specret_sibling_rows
+            if sibling_rows is None or sibling_rows.numel() == 0:
+                self_kv = None
+            elif envs.SGLANG_NSA_FUSE_TOPK.get() and not getattr(
+                metadata, "force_unfused_topk", False
+            ):
+                self_kv = attn_metadata.mtp_specret_sibling_self_page_indices
+            else:
+                self_kv = attn_metadata.mtp_specret_sibling_self_logical_indices
+
+        if envs.SGLANG_NSA_FUSE_REPEAT_PATCH.get():
+            from sglang.srt.layers.attention.nsa.repeat_interleave_patch import (
+                fused_repeat_interleave_and_patch,
+            )
+
+            return fused_repeat_interleave_and_patch(
+                topk_mtp, draft_token_num, self_kv
+            )
+        else:
+            # Fallback: two-step PyTorch path
+            topk_result = topk_mtp.repeat_interleave(draft_token_num, dim=0)
+            if self_kv is not None:
+                sibling_rows = attn_metadata.mtp_specret_sibling_rows
+                topk_result[sibling_rows, -1] = self_kv.to(topk_result.dtype)
+            return topk_result
 
     def _should_chunk_mqa_logits(
         self, num_q: int, num_k: int, device: torch.device

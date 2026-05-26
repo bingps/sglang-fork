@@ -419,6 +419,7 @@ class Envs:
 
     # NSA Backend
     SGLANG_NSA_FUSE_TOPK = EnvBool(True)
+    SGLANG_NSA_FUSE_REPEAT_PATCH = EnvBool(True)
     SGLANG_NSA_ENABLE_SPECRET = EnvBool(False)
     SGLANG_NSA_ENABLE_MTP_PRECOMPUTE_METADATA = EnvBool(True)
     SGLANG_USE_FUSED_METADATA_COPY = EnvBool(True)

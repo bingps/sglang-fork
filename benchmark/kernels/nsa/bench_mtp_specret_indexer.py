@@ -426,8 +426,7 @@ def _profile_specret_breakdown(
             "5_seqlens_unsqueeze",
             "6_fp8_paged_mqa_logits",
             "7_topk_transform",
-            "8_repeat_interleave",
-            "9_sibling_self_kv_patch",
+            "8_fused_repeat_patch",
         ]
     else:
         q_input = t.q_specret       # (B*d, H, D)
@@ -441,8 +440,7 @@ def _profile_specret_breakdown(
             "5_seqlens_unsqueeze",
             "6_fp8_paged_mqa_logits",
             "7_topk_transform",
-            "8_repeat_interleave",
-            "9_sibling_self_kv_patch",
+            "8_fused_repeat_patch",
         ]
 
     def one_run(record: bool):
@@ -525,14 +523,9 @@ def _profile_specret_breakdown(
         if record:
             evs.append(torch.cuda.Event(enable_timing=True)); evs[-1].record()
 
-        # 8: repeat_interleave
-        topk_result = topk_mtp.repeat_interleave(draft_token_num, dim=0)
-        if record:
-            evs.append(torch.cuda.Event(enable_timing=True)); evs[-1].record()
-
-        # 9: sibling self-kv patch
-        topk_result = indexer._patch_mtp_specret_sibling_self_kv(
-            topk_result, meta, draft_token_num, q_offset
+        # 8: fused repeat_interleave + sibling self-kv patch
+        topk_result = indexer._fused_repeat_and_patch(
+            topk_mtp, meta, draft_token_num, q_offset
         )
         if record:
             evs.append(torch.cuda.Event(enable_timing=True)); evs[-1].record()
