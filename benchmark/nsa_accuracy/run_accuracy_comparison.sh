@@ -83,17 +83,42 @@ run_eval() {
     echo "[EVAL] Num examples: ${NUM_EXAMPLES}"
     echo "============================================="
 
-    # 取消代理以避免干扰本地连接
-    env -u HTTP_PROXY -u http_proxy -u https_proxy -u HTTPS_PROXY -u no_proxy -u NO_PROXY \
-    python3 -m sglang.test.run_eval \
-        --base-url "${BASE_URL}" \
-        --eval-name "${EVAL_NAME}" \
-        --num-examples "${NUM_EXAMPLES}" \
-        --num-threads "${NUM_THREADS}" \
-        2>&1 | tee "${RESULT_DIR}/${EVAL_NAME}_${config_name}.log"
+    if [ "$EVAL_NAME" = "ceval" ]; then
+        # CEval 使用 sglang 原生 API
+        local ceval_args=(
+            --data-path "ceval/ceval-exam"
+            --host "$HOST"
+            --port "$PORT"
+            --parallel "$NUM_THREADS"
+            --result-file "${RESULT_DIR}/${EVAL_NAME}_${config_name}.jsonl"
+        )
+        if [ "$NUM_EXAMPLES" != "0" ] && [ "$NUM_EXAMPLES" != "5000" ]; then
+            ceval_args+=(--num-questions "$NUM_EXAMPLES")
+        fi
 
-    # 提取分数
-    local score=$(grep -oP 'Score: \K[0-9.]+' "${RESULT_DIR}/${EVAL_NAME}_${config_name}.log" || echo "N/A")
+        # 保留代理(用于下载数据集)，但设置 no_proxy 跳过本地连接
+        # 使用 HF_DATASETS_OFFLINE=1 强制使用缓存，避免 HF API 限流
+        env no_proxy="127.0.0.1,localhost" NO_PROXY="127.0.0.1,localhost" \
+            HF_DATASETS_OFFLINE=1 \
+        python3 benchmark/ceval/bench_sglang.py "${ceval_args[@]}" \
+            2>&1 | tee "${RESULT_DIR}/${EVAL_NAME}_${config_name}.log"
+
+        # 提取分数 (CEval 输出格式: "Accuracy: 0.xxx")
+        local score=$(grep -oP 'Accuracy: \K[0-9.]+' "${RESULT_DIR}/${EVAL_NAME}_${config_name}.log" || echo "N/A")
+    else
+        # 其他 benchmark 使用 OpenAI 兼容 API
+        env -u HTTP_PROXY -u http_proxy -u https_proxy -u HTTPS_PROXY -u no_proxy -u NO_PROXY \
+        python3 -m sglang.test.run_eval \
+            --base-url "${BASE_URL}" \
+            --eval-name "${EVAL_NAME}" \
+            --num-examples "${NUM_EXAMPLES}" \
+            --num-threads "${NUM_THREADS}" \
+            2>&1 | tee "${RESULT_DIR}/${EVAL_NAME}_${config_name}.log"
+
+        # 提取分数 (run_eval 输出格式: "Score: 0.xxx")
+        local score=$(grep -oP 'Score: \K[0-9.]+' "${RESULT_DIR}/${EVAL_NAME}_${config_name}.log" || echo "N/A")
+    fi
+
     echo "[RESULT] ${config_name}: score = ${score}"
     echo "${config_name},${score}" >> "${RESULT_DIR}/${EVAL_NAME}_summary.csv"
 }
