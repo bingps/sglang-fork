@@ -12,6 +12,12 @@
 #   START_FROM=5 EVAL_NAME=ceval bash run_nsa_accuracy.sh     # 从第5个配置开始
 #
 # 支持的 benchmark: mmlu, gsm8k, mgsm_en, ceval, aime25, longbench_v2
+#
+# 推荐配置 (按 benchmark 类型):
+#   短文本 (mmlu/gsm8k/mgsm_en/ceval):
+#     MEM_FRACTION=0.9 CUDA_GRAPH_MAX_BS=16 NUM_THREADS=512 NUM_EXAMPLES=5000
+#   长文本/推理 (aime25/longbench_v2):
+#     MEM_FRACTION=0.88 CUDA_GRAPH_MAX_BS=2 NUM_THREADS=16
 # =============================================================================
 
 set -e
@@ -29,6 +35,11 @@ CUDA_GRAPH_MAX_BS="${CUDA_GRAPH_MAX_BS:-2}"
 EVAL_NAME="${EVAL_NAME:-gsm8k}"          # 空格分隔可跑多个
 NUM_EXAMPLES="${NUM_EXAMPLES:-200}"      # 0=全部
 NUM_THREADS="${NUM_THREADS:-64}"
+
+# 按 benchmark 单独覆盖 NUM_EXAMPLES (优先级高于 NUM_EXAMPLES)
+AIME25_NUM_EXAMPLES="${AIME25_NUM_EXAMPLES:-}"
+LONGBENCH_NUM_EXAMPLES="${LONGBENCH_NUM_EXAMPLES:-}"
+MMLU_NUM_EXAMPLES="${MMLU_NUM_EXAMPLES:-}"
 
 # AIME25 特定配置
 AIME25_MAX_TOKENS="${AIME25_MAX_TOKENS:-32768}"
@@ -136,6 +147,14 @@ run_eval() {
 
     local log_file="${RESULT_DIR}/${eval_name}_${config_name}.log"
 
+    # 按 benchmark 确定 num_examples (单独覆盖 > 全局)
+    local num_ex="$NUM_EXAMPLES"
+    case "$eval_name" in
+        aime25)      [ -n "$AIME25_NUM_EXAMPLES" ] && num_ex="$AIME25_NUM_EXAMPLES" ;;
+        longbench_v2) [ -n "$LONGBENCH_NUM_EXAMPLES" ] && num_ex="$LONGBENCH_NUM_EXAMPLES" ;;
+        mmlu)        [ -n "$MMLU_NUM_EXAMPLES" ] && num_ex="$MMLU_NUM_EXAMPLES" ;;
+    esac
+
     if [ "$eval_name" = "ceval" ]; then
         # CEval 使用 sglang 原生 API
         local ceval_args=(
@@ -144,8 +163,8 @@ run_eval() {
             --parallel "$NUM_THREADS"
             --result-file "${RESULT_DIR}/${eval_name}_${config_name}.jsonl"
         )
-        if [ "$NUM_EXAMPLES" != "0" ]; then
-            ceval_args+=(--num-questions "$NUM_EXAMPLES")
+        if [ "$num_ex" != "0" ]; then
+            ceval_args+=(--num-questions "$num_ex")
         fi
 
         env no_proxy="127.0.0.1,localhost" NO_PROXY="127.0.0.1,localhost" HF_DATASETS_OFFLINE=1 \
@@ -160,8 +179,8 @@ run_eval() {
             --eval-name "${eval_name}"
             --num-threads "${NUM_THREADS}"
         )
-        if [ "$NUM_EXAMPLES" != "0" ]; then
-            eval_args+=(--num-examples "$NUM_EXAMPLES")
+        if [ "$num_ex" != "0" ]; then
+            eval_args+=(--num-examples "$num_ex")
         fi
 
         # 按 benchmark 类型设置 max_tokens 和 temperature
