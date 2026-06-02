@@ -52,22 +52,47 @@ def main(args):
     labels = []
     examples = "examples:\n"
     data_path = args.data_path
-    for subject in os.listdir(data_path):
-        subject_path = os.path.join(data_path, subject)
-        if os.path.isdir(subject_path) and subject != ".git":
-            dataset = load_dataset(data_path, name=subject)
-            dev_lines_temp = dataset["dev"]
-            val_lines_temp = dataset["val"]
-            few_shot_examples = get_few_shot_examples(dev_lines_temp)
-            examples += f"{few_shot_examples}"
-            for val_line in val_lines_temp:
-                arguments.append(
-                    {
-                        "examples": few_shot_examples,
-                        "question": get_one_example(val_line, False),
-                    }
-                )
-                labels.append(val_line["answer"])
+
+    # 支持 HuggingFace Hub 路径 (如 "ceval/ceval-exam") 和本地路径
+    if os.path.isdir(data_path):
+        subjects = [s for s in os.listdir(data_path)
+                    if os.path.isdir(os.path.join(data_path, s)) and s != ".git"]
+    else:
+        # 硬编码 CEval subjects 列表，避免频繁调用 HF API 导致限流
+        _CEVAL_SUBJECTS = [
+            'accountant', 'advanced_mathematics', 'art_studies', 'basic_medicine',
+            'business_administration', 'chinese_language_and_literature', 'civil_servant',
+            'clinical_medicine', 'college_chemistry', 'college_economics', 'college_physics',
+            'college_programming', 'computer_architecture', 'computer_network',
+            'discrete_mathematics', 'education_science', 'electrical_engineer',
+            'environmental_impact_assessment_engineer', 'fire_engineer', 'high_school_biology',
+            'high_school_chemistry', 'high_school_chinese', 'high_school_geography',
+            'high_school_history', 'high_school_mathematics', 'high_school_physics',
+            'high_school_politics', 'ideological_and_moral_cultivation', 'law',
+            'legal_professional', 'logic', 'mao_zedong_thought', 'marxism',
+            'metrology_engineer', 'middle_school_biology', 'middle_school_chemistry',
+            'middle_school_geography', 'middle_school_history', 'middle_school_mathematics',
+            'middle_school_physics', 'middle_school_politics', 'modern_chinese_history',
+            'operating_system', 'physician', 'plant_protection', 'probability_and_statistics',
+            'professional_tour_guide', 'sports_science', 'tax_accountant',
+            'teacher_qualification', 'urban_and_rural_planner', 'veterinary_medicine',
+        ]
+        subjects = _CEVAL_SUBJECTS
+
+    for subject in subjects:
+        dataset = load_dataset(data_path, name=subject)
+        dev_lines_temp = dataset["dev"]
+        val_lines_temp = dataset["val"]
+        few_shot_examples = get_few_shot_examples(dev_lines_temp)
+        examples += f"{few_shot_examples}"
+        for val_line in val_lines_temp:
+            arguments.append(
+                {
+                    "examples": few_shot_examples,
+                    "question": get_one_example(val_line, False),
+                }
+            )
+            labels.append(val_line["answer"])
 
     #####################################
     ######### SGL Program Begin #########
