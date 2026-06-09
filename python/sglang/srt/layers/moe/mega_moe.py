@@ -162,7 +162,10 @@ def _run_mega_routed(
     hidden_size = moe.config.hidden_size
 
     if num_tokens > 0:
-        router_logits = moe.gate(hidden_states, forward_batch=forward_batch)
+        if hasattr(moe, "_mega_gate"):
+            router_logits = moe._mega_gate(hidden_states, forward_batch=forward_batch)
+        else:
+            router_logits = moe.gate(hidden_states, forward_batch=forward_batch)
         topk_kwargs = {"input_ids": input_ids_global} if moe.is_hash else {}
         topk_output = moe.topk(
             hidden_states,
@@ -263,7 +266,9 @@ def _run_mega_routed(
     y = y[:num_tokens]
 
     if not moe.experts.should_fuse_routed_scaling_factor_in_topk:
-        y.mul_(moe.routed_scaling_factor)
+        rsf = getattr(moe, "routed_scaling_factor", 1.0)
+        if rsf != 1.0:
+            y.mul_(rsf)
     return y
 
 

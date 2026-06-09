@@ -608,7 +608,7 @@ class FusedMoE(torch.nn.Module):
         # if expert_id is None, then
         # all the experts are loaded at the same time
         if (
-            not expert_id
+            expert_id is None
             and self.quant_config is not None
             and self.quant_config.get_name() == "mxfp4"
             and self.quant_config.is_static_cfg()
@@ -620,6 +620,32 @@ class FusedMoE(torch.nn.Module):
                 dim1 = loaded_weight.shape[1]
                 dim2 = loaded_weight.shape[2]
                 param.data[:, :dim1, :dim2].copy_(loaded_weight)
+            return
+
+        if (
+            expert_id is not None
+            and self.quant_config is not None
+            and self.quant_config.get_name() == "mxfp4"
+            and self.quant_config.is_static_cfg()
+        ):
+            if "bias" in weight_name:
+                dim0 = loaded_weight.shape[0]
+                if shard_id == "w1":
+                    param.data[expert_id, :dim0].copy_(loaded_weight)
+                elif shard_id == "w3":
+                    param.data[expert_id, dim0 : 2 * dim0].copy_(loaded_weight)
+                elif shard_id == "w2":
+                    param.data[expert_id, :dim0].copy_(loaded_weight)
+            elif loaded_weight.dim() == 2:
+                dim0, dim1 = loaded_weight.shape
+                if shard_id == "w1":
+                    param.data[expert_id, :dim0, :dim1].copy_(loaded_weight)
+                elif shard_id == "w3":
+                    param.data[expert_id, dim0 : 2 * dim0, :dim1].copy_(loaded_weight)
+                elif shard_id == "w2":
+                    param.data[expert_id, :dim0, :dim1].copy_(loaded_weight)
+            else:
+                param.data[expert_id].copy_(loaded_weight)
             return
 
         global_expert_location_metadata = get_global_expert_location_metadata()

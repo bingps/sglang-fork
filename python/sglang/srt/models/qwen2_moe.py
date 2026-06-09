@@ -219,9 +219,12 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         support_shared_expert_fusion: bool = False,
     ):
         super().__init__()
+        self.config = config
         self.tp_size = get_tensor_model_parallel_world_size()
         self.layer_id = layer_id
         self.alt_stream = alt_stream
+        self.is_hash = False
+        self.routed_scaling_factor = 1.0
         if self.tp_size > config.num_experts:
             raise ValueError(
                 f"Tensor parallel size {self.tp_size} is greater than "
@@ -389,6 +392,10 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             router_logits=topk_output.router_logits,
         )
 
+    def _mega_gate(self, hidden_states, forward_batch=None):
+        logits, _ = self.gate(hidden_states)
+        return logits
+
     def _forward_shared_experts(self, hidden_states: torch.Tensor):
         shared_output = None
         if self.shared_expert is not None:
@@ -506,6 +513,11 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
     ) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
+
+        from sglang.srt.layers.moe.mega_moe import forward_mega_moe, should_use_mega_moe
+
+        if should_use_mega_moe(self, hidden_states):
+            return forward_mega_moe(self, hidden_states, forward_batch)
 
         if get_moe_a2a_backend().is_deepep():
             return self._forward_deepep(hidden_states, forward_batch)

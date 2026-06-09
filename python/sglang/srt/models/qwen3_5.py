@@ -567,7 +567,7 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
 
         linear_attn_quant_config = (
             None
-            if quant_config and quant_config.get_name() == "modelopt_fp4"
+            if quant_config and quant_config.get_name() in ("modelopt_fp4", "mxfp4")
             else quant_config
         )
         self.linear_attn = Qwen3_5GatedDeltaNet(
@@ -740,7 +740,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
 
         attn_quant_config = (
             None
-            if quant_config and quant_config.get_name() == "modelopt_fp4"
+            if quant_config and quant_config.get_name() in ("modelopt_fp4", "mxfp4")
             else quant_config
         )
 
@@ -1362,16 +1362,22 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
                 return False
             param = params_dict[name]
             weight_loader = param.weight_loader
-            # let ep moe layer to gracefully handle expert_ids that do not belong to local moe rank
-            for expert_id in range(num_experts):
-                curr_expert_weight = loaded_weight[expert_id]
-                weight_loader(
-                    param,
-                    curr_expert_weight,
-                    name,
-                    shard_id,
-                    expert_id,
-                )
+            if (
+                self.quant_config is not None
+                and self.quant_config.get_name() == "mxfp4"
+                and self.quant_config.is_static_cfg()
+            ):
+                weight_loader(param, loaded_weight, name, shard_id, None)
+            else:
+                for expert_id in range(num_experts):
+                    curr_expert_weight = loaded_weight[expert_id]
+                    weight_loader(
+                        param,
+                        curr_expert_weight,
+                        name,
+                        shard_id,
+                        expert_id,
+                    )
             return True
 
         loaded_params: Set[str] = set()
@@ -1812,16 +1818,22 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 return False
             param = params_dict[name]
             weight_loader = param.weight_loader
-            # let ep moe layer to gracefully handle expert_ids that do not belong to local moe rank
-            for expert_id in range(num_experts):
-                curr_expert_weight = loaded_weight[expert_id]
-                weight_loader(
-                    param,
-                    curr_expert_weight,
-                    name,
-                    shard_id,
-                    expert_id,
-                )
+            if (
+                self.quant_config is not None
+                and self.quant_config.get_name() == "mxfp4"
+                and self.quant_config.is_static_cfg()
+            ):
+                weight_loader(param, loaded_weight, name, shard_id, None)
+            else:
+                for expert_id in range(num_experts):
+                    curr_expert_weight = loaded_weight[expert_id]
+                    weight_loader(
+                        param,
+                        curr_expert_weight,
+                        name,
+                        shard_id,
+                        expert_id,
+                    )
             return True
 
         loaded_params: Set[str] = set()

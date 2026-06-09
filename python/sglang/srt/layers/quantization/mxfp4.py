@@ -365,16 +365,13 @@ class Mxfp4Config(QuantizationConfig):
                 fused_mapping=self.packed_modules_mapping,
             ):
                 return UnquantizedLinearMethod()
-            elif _is_hip:
+            else:
                 return UnquantizedLinearMethod()
         elif isinstance(layer, FusedMoE):
             if self.is_checkpoint_mxfp4_serialized:
                 return Mxfp4MoEMethod(prefix=prefix)
             else:
                 return Mxfp4DynamicQuantMoEMethod()
-        else:
-            if self.is_checkpoint_mxfp4_serialized:
-                raise NotImplementedError("Mxfp4 attention layer is not implemented")
         return None
 
     def get_scaled_act_names(self) -> List[str]:
@@ -560,6 +557,29 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         set_weight_attrs(w2_weight_bias, extra_weight_attrs)
 
     def process_weights_after_loading(self, layer):
+        from sglang.srt.layers.moe.utils import get_moe_a2a_backend
+
+        if get_moe_a2a_backend().is_megamoe():
+            from sglang.srt.layers.moe.mega_moe import (
+                build_mega_moe_experts_weights,
+            )
+
+            def _ue8m0_to_fp32(t):
+                return torch.pow(2.0, t.to(torch.float32) - 127.0)
+
+            layer.w13_weight_scale_inv = layer.w13_weight_scale
+            layer.w2_weight_scale_inv = layer.w2_weight_scale
+            layer.w13_weight_scale_inv.data = _ue8m0_to_fp32(
+                layer.w13_weight_scale_inv.data
+            )
+            layer.w2_weight_scale_inv.data = _ue8m0_to_fp32(
+                layer.w2_weight_scale_inv.data
+            )
+            layer.w13_weight.data = layer.w13_weight.data.view(torch.int8)
+            layer.w2_weight.data = layer.w2_weight.data.view(torch.int8)
+            build_mega_moe_experts_weights(layer)
+            return
+
         if self.use_marlin:
             from sglang.srt.layers.quantization.marlin_utils import (
                 check_moe_marlin_supports_layer,
