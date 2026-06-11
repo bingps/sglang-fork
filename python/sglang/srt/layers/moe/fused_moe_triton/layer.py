@@ -628,6 +628,10 @@ class FusedMoE(torch.nn.Module):
             and self.quant_config.get_name() == "mxfp4"
             and self.quant_config.is_static_cfg()
         ):
+            if not getattr(param, "_sglang_require_global_experts", False):
+                expert_id = self._map_global_expert_id_to_local_expert_id(expert_id)
+                if expert_id == -1:
+                    return
             if "bias" in weight_name:
                 dim0 = loaded_weight.shape[0]
                 if shard_id == "w1":
