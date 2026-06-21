@@ -30,6 +30,9 @@ HOST="${HOST:-127.0.0.1}"
 BASE_URL="http://${HOST}:${PORT}"
 MEM_FRACTION="${MEM_FRACTION:-0.88}"
 CUDA_GRAPH_MAX_BS="${CUDA_GRAPH_MAX_BS:-2}"
+QUANTIZATION="${QUANTIZATION:-}"
+DISABLE_CUDA_GRAPH="${DISABLE_CUDA_GRAPH:-}"
+PYTHON="${PYTHON:-python3}"
 
 # 评测配置
 EVAL_NAME="${EVAL_NAME:-gsm8k}"          # 空格分隔可跑多个
@@ -69,15 +72,21 @@ BASE_ARGS=(
     --host "$HOST"
     --port "$PORT"
 )
+if [ -n "$QUANTIZATION" ]; then
+    BASE_ARGS+=(--quantization "$QUANTIZATION")
+fi
+if [ "$DISABLE_CUDA_GRAPH" = "1" ]; then
+    BASE_ARGS+=(--disable-cuda-graph)
+fi
 
 # 7 个对比配置: name|draft_tokens|extra_env|index_topk_freq
 CONFIGS=(
     "baseline_d2|2||"
     "specret_d2|2|SGLANG_NSA_ENABLE_SPECRET=1|"
-    "specret_d3|3|SGLANG_NSA_ENABLE_SPECRET=1|"
-    "specret_d4|4|SGLANG_NSA_ENABLE_SPECRET=1|"
     "index_topk_freq_2|2||2"
+    "specret_d3|3|SGLANG_NSA_ENABLE_SPECRET=1|"
     "index_topk_freq_3|2||3"
+    "specret_d4|4|SGLANG_NSA_ENABLE_SPECRET=1|"
     "index_topk_freq_4|2||4"
 )
 
@@ -87,6 +96,26 @@ kill_server() {
     echo "[INFO] Killing server..."
     bash scripts/killall_sglang.sh 2>/dev/null || true
     sleep 10
+}
+
+collect_spec_metrics() {
+    local config_name="$1"
+    local eval_name="$2"
+    local csv_file="${RESULT_DIR}/${eval_name}_spec_metrics.csv"
+
+    local server_info
+    server_info=$(env -u HTTP_PROXY -u http_proxy -u HTTPS_PROXY -u https_proxy -u no_proxy -u NO_PROXY \
+        curl -sf "${BASE_URL}/server_info" 2>/dev/null) || {
+        echo "[WARN] Failed to get server info for ${config_name}"
+        echo "${config_name},N/A" >> "$csv_file"
+        return
+    }
+
+    local accept_length
+    accept_length=$($PYTHON -c "import json,sys; d=json.load(sys.stdin); s=d.get('internal_states',[]); print(s[0].get('avg_spec_accept_length','N/A') if s else 'N/A')" <<< "$server_info" 2>/dev/null) || accept_length="N/A"
+
+    echo "[METRIC] ${config_name} | accept_length: ${accept_length}"
+    echo "${config_name},${accept_length}" >> "$csv_file"
 }
 
 launch_server() {
@@ -111,11 +140,11 @@ launch_server() {
 
     if [ -n "$extra_env" ]; then
         env -u HTTP_PROXY -u http_proxy -u HTTPS_PROXY -u https_proxy -u no_proxy -u NO_PROXY \
-            $extra_env python3 -m sglang.launch_server "${cmd_args[@]}" \
+            $extra_env $PYTHON -m sglang.launch_server "${cmd_args[@]}" \
             &> "${RESULT_DIR}/server_${config_name}.log" &
     else
         env -u HTTP_PROXY -u http_proxy -u HTTPS_PROXY -u https_proxy -u no_proxy -u NO_PROXY \
-            python3 -m sglang.launch_server "${cmd_args[@]}" \
+            $PYTHON -m sglang.launch_server "${cmd_args[@]}" \
             &> "${RESULT_DIR}/server_${config_name}.log" &
     fi
     local server_pid=$!
@@ -168,7 +197,7 @@ run_eval() {
         fi
 
         env no_proxy="127.0.0.1,localhost" NO_PROXY="127.0.0.1,localhost" HF_DATASETS_OFFLINE=1 \
-            python3 benchmark/ceval/bench_sglang.py "${ceval_args[@]}" \
+            $PYTHON benchmark/ceval/bench_sglang.py "${ceval_args[@]}" \
             2>&1 | tee "$log_file"
 
         local score=$(grep -oP 'Accuracy: \K[0-9.]+' "$log_file" || echo "N/A")
@@ -178,6 +207,7 @@ run_eval() {
             --base-url "${BASE_URL}"
             --eval-name "${eval_name}"
             --num-threads "${NUM_THREADS}"
+            --model "$MODEL_PATH"
         )
         if [ "$num_ex" != "0" ]; then
             eval_args+=(--num-examples "$num_ex")
@@ -198,7 +228,7 @@ run_eval() {
         esac
 
         env no_proxy="127.0.0.1,localhost" NO_PROXY="127.0.0.1,localhost" \
-            python3 -m sglang.test.run_eval "${eval_args[@]}" \
+            $PYTHON -m sglang.test.run_eval "${eval_args[@]}" \
             2>&1 | tee "$log_file"
 
         local score=$(grep -oP 'Score: \K[0-9.]+' "$log_file" || echo "N/A")
@@ -237,6 +267,10 @@ for config_str in "${CONFIGS[@]}"; do
         run_eval "$config_name" "$bench"
     done
 
+    for bench in $EVAL_NAME; do
+        collect_spec_metrics "$config_name" "$bench"
+    done
+
     kill_server
 done
 
@@ -247,6 +281,9 @@ for bench in $EVAL_NAME; do
     echo ""
     echo "--- ${bench} ---"
     column -t -s',' "${RESULT_DIR}/${bench}_summary.csv" 2>/dev/null || echo "(no results)"
+    echo ""
+    echo "--- ${bench} spec metrics ---"
+    column -t -s',' "${RESULT_DIR}/${bench}_spec_metrics.csv" 2>/dev/null || echo "(no metrics)"
 done
 echo ""
 echo "跳过率对应关系:"
