@@ -156,6 +156,34 @@ def run_eval(args):
             max_context_length=getattr(args, "max_context_length", None),
             min_context_length=getattr(args, "min_context_length", None),
         )
+    elif args.eval_name == "mrcr":
+        from sglang.test.simple_eval_mrcr import MRCREval
+
+        eval_obj = MRCREval(
+            num_examples=args.num_examples,
+            num_threads=args.num_threads,
+            n_needles=getattr(args, "n_needles", None),
+            min_context_length=getattr(args, "min_context_length", None),
+            max_context_length=getattr(args, "max_context_length", None),
+        )
+    elif args.eval_name == "graphwalks":
+        from sglang.test.simple_eval_graphwalks import GraphWalksEval
+
+        eval_obj = GraphWalksEval(
+            num_examples=args.num_examples,
+            num_threads=args.num_threads,
+            problem_type=getattr(args, "problem_type", None),
+            max_prompt_chars=getattr(args, "max_prompt_chars", None),
+        )
+    elif args.eval_name == "ruler":
+        from sglang.test.simple_eval_ruler import RULEREval
+
+        eval_obj = RULEREval(
+            num_examples=args.num_examples,
+            num_threads=args.num_threads,
+            ruler_tasks=getattr(args, "ruler_tasks", None),
+            ruler_length=getattr(args, "ruler_length", None),
+        )
     elif args.eval_name == "mmmu":
         # VLM MMMU evaluation with fixed 100 examples by default
         from sglang.test.simple_eval_mmmu_vlm import MMMUVLMEval
@@ -355,6 +383,44 @@ if __name__ == "__main__":
         type=int,
         help="Minimum context length in characters for LongBench-v2",
     )
+    # MRCR specific arguments
+    parser.add_argument(
+        "--n-needles",
+        type=int,
+        default=None,
+        help="Filter MRCR examples by needle count (2, 4, or 8)",
+    )
+
+    # GraphWalks specific arguments
+    parser.add_argument(
+        "--problem-type",
+        type=str,
+        default=None,
+        choices=["bfs", "parents"],
+        help="Filter GraphWalks examples by problem type",
+    )
+    parser.add_argument(
+        "--max-prompt-chars",
+        type=int,
+        default=None,
+        help="Filter GraphWalks examples by max prompt character count",
+    )
+
+    # RULER specific arguments
+    parser.add_argument(
+        "--ruler-tasks",
+        type=str,
+        default=None,
+        help="Comma-separated RULER task configs (e.g. niah_multikey_1_4k,vt_8k)",
+    )
+    parser.add_argument(
+        "--ruler-length",
+        type=str,
+        default=None,
+        choices=["4k", "8k"],
+        help="Filter RULER tasks by context length",
+    )
+
     parser.add_argument(
         "--num-shots",
         type=int,

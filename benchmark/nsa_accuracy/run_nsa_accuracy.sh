@@ -9,15 +9,18 @@
 #   EVAL_NAME=ceval bash run_nsa_accuracy.sh
 #   EVAL_NAME=aime25 bash run_nsa_accuracy.sh
 #   EVAL_NAME="longbench_v2 aime25" bash run_nsa_accuracy.sh  # 多 benchmark
+#   EVAL_NAME="mrcr graphwalks" bash run_nsa_accuracy.sh     # 长文本 benchmark
 #   START_FROM=5 EVAL_NAME=ceval bash run_nsa_accuracy.sh     # 从第5个配置开始
 #
-# 支持的 benchmark: mmlu, gsm8k, mgsm_en, ceval, aime25, longbench_v2
+# 支持的 benchmark: mmlu, gsm8k, mgsm_en, ceval, aime25, longbench_v2, mrcr, graphwalks, ruler
 #
 # 推荐配置 (按 benchmark 类型):
 #   短文本 (mmlu/gsm8k/mgsm_en/ceval):
 #     MEM_FRACTION=0.9 CUDA_GRAPH_MAX_BS=16 NUM_THREADS=512 NUM_EXAMPLES=5000
-#   长文本/推理 (aime25/longbench_v2):
+#   长文本/推理 (aime25/longbench_v2/mrcr/graphwalks):
 #     MEM_FRACTION=0.88 CUDA_GRAPH_MAX_BS=2 NUM_THREADS=16
+#   合成任务 (ruler):
+#     MEM_FRACTION=0.9 CUDA_GRAPH_MAX_BS=8 NUM_THREADS=128
 # =============================================================================
 
 set -e
@@ -43,6 +46,9 @@ NUM_THREADS="${NUM_THREADS:-64}"
 AIME25_NUM_EXAMPLES="${AIME25_NUM_EXAMPLES:-}"
 LONGBENCH_NUM_EXAMPLES="${LONGBENCH_NUM_EXAMPLES:-}"
 MMLU_NUM_EXAMPLES="${MMLU_NUM_EXAMPLES:-}"
+MRCR_NUM_EXAMPLES="${MRCR_NUM_EXAMPLES:-}"
+GRAPHWALKS_NUM_EXAMPLES="${GRAPHWALKS_NUM_EXAMPLES:-}"
+RULER_NUM_EXAMPLES="${RULER_NUM_EXAMPLES:-}"
 
 # AIME25 特定配置
 AIME25_MAX_TOKENS="${AIME25_MAX_TOKENS:-32768}"
@@ -182,6 +188,9 @@ run_eval() {
         aime25)      [ -n "$AIME25_NUM_EXAMPLES" ] && num_ex="$AIME25_NUM_EXAMPLES" ;;
         longbench_v2) [ -n "$LONGBENCH_NUM_EXAMPLES" ] && num_ex="$LONGBENCH_NUM_EXAMPLES" ;;
         mmlu)        [ -n "$MMLU_NUM_EXAMPLES" ] && num_ex="$MMLU_NUM_EXAMPLES" ;;
+        mrcr)        [ -n "$MRCR_NUM_EXAMPLES" ] && num_ex="$MRCR_NUM_EXAMPLES" ;;
+        graphwalks)  [ -n "$GRAPHWALKS_NUM_EXAMPLES" ] && num_ex="$GRAPHWALKS_NUM_EXAMPLES" ;;
+        ruler)       [ -n "$RULER_NUM_EXAMPLES" ] && num_ex="$RULER_NUM_EXAMPLES" ;;
     esac
 
     if [ "$eval_name" = "ceval" ]; then
@@ -221,6 +230,15 @@ run_eval() {
             longbench_v2)
                 eval_args+=(--max-tokens 2048)
                 [ -n "$LONGBENCH_MIN_CTX" ] && eval_args+=(--min-context-length "$LONGBENCH_MIN_CTX")
+                ;;
+            mrcr)
+                eval_args+=(--max-tokens 4096)
+                ;;
+            graphwalks)
+                eval_args+=(--max-tokens 4096)
+                ;;
+            ruler)
+                eval_args+=(--max-tokens 512)
                 ;;
             *)
                 eval_args+=(--max-tokens 2048)
