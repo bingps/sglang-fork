@@ -283,3 +283,14 @@ test/registered/xpu/test_nvidia_nemotron_3_nano.py
 artifacts/
 .claude/scheduled_tasks.lock
 .humanize/
+
+profile_traces/
+.run_timestamp
+*.trace.json.gz
+
+# DSv4f indexer topk capture data (keep README and scripts)
+dsv4f-topk/*.npz
+dsv4f-topk/*.json
+dsv4f-topk/*.csv
+dsv4f-topk/*.png
+dsv4f-topk/kv_dump/

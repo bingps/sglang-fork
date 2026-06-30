@@ -1,0 +1,6 @@
+# Captured data (large)
+dsv4f-topk/req_*.npz
+dsv4f-topk/kv_dump/
+dsv4f-topk/*.json
+dsv4f-topk/*.csv
+dsv4f-topk/*.png

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
 from typing import (
     TYPE_CHECKING,
@@ -148,11 +149,73 @@ class SchedulerBatchResultProcessor:
         if capturer is None:
             return
         seqlen = len(req.origin_input_ids) + len(req.output_ids_through_stop)
+        start_len = max(len(req.origin_input_ids) - 1, 0)
         req.indexer_topk = capturer.get_topk(
             req_pool_idx=req.req_pool_idx,
             seqlen=seqlen,
             req_to_token_pool=self.req_to_token_pool,
+            start_len=start_len,
         )
+        self._maybe_dump_kv_to_disk(req, seqlen)
+
+    def _maybe_dump_kv_to_disk(self, req: Req, seqlen: int):
+        dump_dir = os.environ.get("SGLANG_DUMP_KV_DIR")
+        if not dump_dir:
+            return
+        pool = self.token_to_kv_pool_allocator._kvcache
+        if not hasattr(pool, "compression_ratios"):
+            return
+        token_locs = self.req_to_token_pool.req_to_token[
+            req.req_pool_idx, :seqlen
+        ]
+        c4_mask = (token_locs + 1) % 4 == 0
+        c4_locs = token_locs[c4_mask] // 4
+        n_c4 = int(c4_locs.shape[0])
+        c4_layer_ids = [
+            i for i, r in enumerate(pool.compression_ratios) if r == 4
+        ]
+        c4_kv_list = []
+        idx_k_list = []
+        for layer_id in c4_layer_ids:
+            item = pool.layer_mapping[layer_id]
+            clid = item.compress_layer_id
+            kv_buf = pool.c4_kv_pool.kv_buffer[clid]
+            ps = pool.c4_kv_pool.page_size
+            bpt_kv = pool.c4_kv_pool.kv_cache_total_dim
+            pages = c4_locs // ps
+            offsets = c4_locs % ps
+            byte_starts = (offsets * bpt_kv).unsqueeze(1)
+            page_byte_offsets = (pages * kv_buf.shape[1]).unsqueeze(1)
+            row_indices = torch.arange(bpt_kv, device=kv_buf.device).unsqueeze(0)
+            flat = page_byte_offsets + byte_starts + row_indices
+            kv_data = kv_buf.reshape(-1)[flat.reshape(-1)].reshape(n_c4, bpt_kv)
+            c4_kv_list.append(kv_data.cpu())
+            idx_buf = pool.c4_indexer_kv_pool.index_k_with_scale_buffer[clid]
+            bpt_idx = pool.c4_indexer_kv_pool.get_bytes_per_token()
+            ips = pool.c4_indexer_kv_pool.page_size
+            ipages = c4_locs // ips
+            ioffsets = c4_locs % ips
+            ibyte_starts = (ioffsets * bpt_idx).unsqueeze(1)
+            ipage_byte_offsets = (ipages * idx_buf.shape[1]).unsqueeze(1)
+            irow = torch.arange(bpt_idx, device=idx_buf.device).unsqueeze(0)
+            iflat = ipage_byte_offsets + ibyte_starts + irow
+            idx_data = idx_buf.reshape(-1)[iflat.reshape(-1)].reshape(n_c4, bpt_idx)
+            idx_k_list.append(idx_data.cpu())
+        save_dict = {
+            "rid": req.rid,
+            "seqlen": seqlen,
+            "prompt_tokens": len(req.origin_input_ids),
+            "completion_tokens": len(req.output_ids_through_stop),
+            "c4_compressed_len": n_c4,
+            "c4_layer_ids": c4_layer_ids,
+            "c4_kv": torch.stack(c4_kv_list),
+            "indexer_k": torch.stack(idx_k_list),
+        }
+        os.makedirs(dump_dir, exist_ok=True)
+        path = os.path.join(dump_dir, f"req_{req.rid}.pt")
+        torch.save(save_dict, path)
+        logger.info("Dumped KV for req %s -> %s (c4=%d tokens, %d layers)",
+                     req.rid, path, n_c4, len(c4_layer_ids))
 
     def _maybe_collect_customized_info(
         self,
