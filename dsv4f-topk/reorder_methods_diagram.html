@@ -1,0 +1,376 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<title>Spectral CoOc & Greedy CoOc 方法示意图</title>
+<style>
+  body { font-family: -apple-system, "Helvetica Neue", Arial, sans-serif; background: #f8f9fa; margin: 0; padding: 40px; }
+  .container { max-width: 1200px; margin: 0 auto; }
+  h1 { text-align: center; color: #1a1a2e; margin-bottom: 40px; }
+  .diagram { background: #fff; border-radius: 12px; box-shadow: 0 2px 12px rgba(0,0,0,0.08); padding: 32px; margin-bottom: 40px; }
+  .diagram h2 { color: #16213e; margin-top: 0; border-bottom: 2px solid #e2e8f0; padding-bottom: 12px; }
+  .step-row { display: flex; align-items: flex-start; gap: 20px; margin: 24px 0; }
+  .step-num { flex-shrink: 0; width: 36px; height: 36px; border-radius: 50%; background: #4361ee; color: #fff; display: flex; align-items: center; justify-content: center; font-weight: 700; font-size: 16px; }
+  .step-num.red { background: #e63946; }
+  .step-content { flex: 1; }
+  .step-content h3 { margin: 0 0 8px; color: #2b2d42; font-size: 15px; }
+  .step-content p { margin: 0; color: #555; font-size: 14px; line-height: 1.6; }
+  .arrow-down { text-align: center; font-size: 28px; color: #adb5bd; margin: 4px 0; }
+  svg { display: block; margin: 16px auto; }
+  .legend { display: flex; gap: 24px; justify-content: center; margin: 16px 0; flex-wrap: wrap; }
+  .legend-item { display: flex; align-items: center; gap: 6px; font-size: 13px; color: #555; }
+  .legend-dot { width: 14px; height: 14px; border-radius: 3px; }
+  .note { background: #fff3cd; border-left: 4px solid #ffc107; padding: 12px 16px; border-radius: 0 8px 8px 0; margin: 20px 0; font-size: 13px; color: #664d03; }
+</style>
+</head>
+<body>
+<div class="container">
+<h1>Token 重排方法示意图</h1>
+
+<!-- ==================== Spectral CoOc ==================== -->
+<div class="diagram">
+<h2>方法 A: Spectral CoOc (共选矩阵谱聚类)</h2>
+
+<div class="step-row">
+  <div class="step-num">1</div>
+  <div class="step-content">
+    <h3>收集所有 decode step 的 topk 选择</h3>
+    <p>每步 indexer 选出 512 个 C4 压缩 token 位置。遍历全部 decode steps 记录每步的选中集合。</p>
+  </div>
+</div>
+
+<svg width="700" height="120" viewBox="0 0 700 120">
+  <!-- decode steps -->
+  <text x="10" y="20" font-size="12" fill="#555">Step 1:</text>
+  <text x="10" y="50" font-size="12" fill="#555">Step 2:</text>
+  <text x="10" y="80" font-size="12" fill="#555">Step t:</text>
+  <!-- token bars -->
+  <g transform="translate(70,5)">
+    <rect x="0" y="0" width="600" height="22" rx="3" fill="#f1f3f5" stroke="#dee2e6"/>
+    <!-- selected tokens step 1 -->
+    <rect x="10" y="2" width="8" height="18" rx="2" fill="#4361ee" opacity="0.8"/>
+    <rect x="25" y="2" width="8" height="18" rx="2" fill="#4361ee" opacity="0.8"/>
+    <rect x="80" y="2" width="8" height="18" rx="2" fill="#4361ee" opacity="0.8"/>
+    <rect x="150" y="2" width="8" height="18" rx="2" fill="#4361ee" opacity="0.8"/>
+    <rect x="200" y="2" width="8" height="18" rx="2" fill="#4361ee" opacity="0.8"/>
+    <rect x="350" y="2" width="8" height="18" rx="2" fill="#4361ee" opacity="0.8"/>
+    <rect x="420" y="2" width="8" height="18" rx="2" fill="#4361ee" opacity="0.8"/>
+    <rect x="500" y="2" width="8" height="18" rx="2" fill="#4361ee" opacity="0.8"/>
+    <rect x="550" y="2" width="8" height="18" rx="2" fill="#4361ee" opacity="0.8"/>
+  </g>
+  <g transform="translate(70,35)">
+    <rect x="0" y="0" width="600" height="22" rx="3" fill="#f1f3f5" stroke="#dee2e6"/>
+    <rect x="10" y="2" width="8" height="18" rx="2" fill="#e63946" opacity="0.8"/>
+    <rect x="80" y="2" width="8" height="18" rx="2" fill="#e63946" opacity="0.8"/>
+    <rect x="120" y="2" width="8" height="18" rx="2" fill="#e63946" opacity="0.8"/>
+    <rect x="200" y="2" width="8" height="18" rx="2" fill="#e63946" opacity="0.8"/>
+    <rect x="280" y="2" width="8" height="18" rx="2" fill="#e63946" opacity="0.8"/>
+    <rect x="350" y="2" width="8" height="18" rx="2" fill="#e63946" opacity="0.8"/>
+    <rect x="420" y="2" width="8" height="18" rx="2" fill="#e63946" opacity="0.8"/>
+    <rect x="530" y="2" width="8" height="18" rx="2" fill="#e63946" opacity="0.8"/>
+  </g>
+  <g transform="translate(70,65)">
+    <rect x="0" y="0" width="600" height="22" rx="3" fill="#f1f3f5" stroke="#dee2e6"/>
+    <rect x="10" y="2" width="8" height="18" rx="2" fill="#2a9d8f" opacity="0.8"/>
+    <rect x="25" y="2" width="8" height="18" rx="2" fill="#2a9d8f" opacity="0.8"/>
+    <rect x="120" y="2" width="8" height="18" rx="2" fill="#2a9d8f" opacity="0.8"/>
+    <rect x="150" y="2" width="8" height="18" rx="2" fill="#2a9d8f" opacity="0.8"/>
+    <rect x="280" y="2" width="8" height="18" rx="2" fill="#2a9d8f" opacity="0.8"/>
+    <rect x="350" y="2" width="8" height="18" rx="2" fill="#2a9d8f" opacity="0.8"/>
+    <rect x="500" y="2" width="8" height="18" rx="2" fill="#2a9d8f" opacity="0.8"/>
+    <rect x="550" y="2" width="8" height="18" rx="2" fill="#2a9d8f" opacity="0.8"/>
+  </g>
+  <text x="680" y="52" font-size="11" fill="#999" text-anchor="end">...</text>
+  <text x="370" y="108" font-size="11" fill="#888" text-anchor="middle">C4 compressed token positions (0 ~ 25K)</text>
+</svg>
+
+<div class="arrow-down">&#x25BC;</div>
+
+<div class="step-row">
+  <div class="step-num">2</div>
+  <div class="step-content">
+    <h3>构建共选矩阵 W (n×n sparse)</h3>
+    <p>W[i,j] = token i 和 token j 在所有 steps 中被同一次 topk 同时选中的次数。W 是对称稀疏矩阵。</p>
+  </div>
+</div>
+
+<svg width="440" height="200" viewBox="0 0 440 200">
+  <!-- matrix -->
+  <rect x="60" y="10" width="160" height="160" fill="#f8f9fa" stroke="#adb5bd" rx="4"/>
+  <!-- hot cells (co-selected pairs) -->
+  <rect x="70" y="20" width="12" height="12" fill="#4361ee" opacity="0.9" rx="2"/>
+  <rect x="70" y="40" width="12" height="12" fill="#4361ee" opacity="0.5" rx="2"/>
+  <rect x="90" y="20" width="12" height="12" fill="#4361ee" opacity="0.5" rx="2"/>
+  <rect x="90" y="40" width="12" height="12" fill="#4361ee" opacity="0.9" rx="2"/>
+  <rect x="110" y="60" width="12" height="12" fill="#e63946" opacity="0.9" rx="2"/>
+  <rect x="110" y="80" width="12" height="12" fill="#e63946" opacity="0.6" rx="2"/>
+  <rect x="130" y="60" width="12" height="12" fill="#e63946" opacity="0.6" rx="2"/>
+  <rect x="130" y="80" width="12" height="12" fill="#e63946" opacity="0.9" rx="2"/>
+  <rect x="150" y="100" width="12" height="12" fill="#2a9d8f" opacity="0.9" rx="2"/>
+  <rect x="150" y="120" width="12" height="12" fill="#2a9d8f" opacity="0.4" rx="2"/>
+  <rect x="170" y="100" width="12" height="12" fill="#2a9d8f" opacity="0.4" rx="2"/>
+  <rect x="170" y="120" width="12" height="12" fill="#2a9d8f" opacity="0.9" rx="2"/>
+  <rect x="190" y="140" width="12" height="12" fill="#f4a261" opacity="0.9" rx="2"/>
+  <!-- cross-cluster weak -->
+  <rect x="110" y="20" width="12" height="12" fill="#ccc" opacity="0.3" rx="2"/>
+  <rect x="70" y="60" width="12" height="12" fill="#ccc" opacity="0.2" rx="2"/>
+  <!-- labels -->
+  <text x="140" y="190" font-size="11" fill="#888" text-anchor="middle">token j</text>
+  <text x="40" y="95" font-size="11" fill="#888" text-anchor="middle" transform="rotate(-90, 40, 95)">token i</text>
+  <text x="140" y="8" font-size="12" fill="#333" text-anchor="middle" font-weight="600">W[i,j] = 共选次数</text>
+  <!-- annotation -->
+  <line x1="230" y1="30" x2="250" y2="30" stroke="#4361ee" stroke-width="2"/>
+  <text x="255" y="34" font-size="11" fill="#555">经常一起选中的 pair → 高值</text>
+  <line x1="230" y1="55" x2="250" y2="55" stroke="#ccc" stroke-width="2"/>
+  <text x="255" y="59" font-size="11" fill="#555">很少一起选中 → 低值/零</text>
+  <text x="255" y="90" font-size="11" fill="#888">矩阵呈现块对角结构:</text>
+  <text x="255" y="106" font-size="11" fill="#888">共选频繁的 token 形成社区</text>
+</svg>
+
+<div class="arrow-down">&#x25BC;</div>
+
+<div class="step-row">
+  <div class="step-num">3</div>
+  <div class="step-content">
+    <h3>归一化 Laplacian + 特征分解</h3>
+    <p>L = I - D<sup>-1/2</sup> W D<sup>-1/2</sup> → 提取最小的 k 个特征向量 → 每个 token 得到一个 k 维谱嵌入。在谱空间里，经常共选的 token 距离近。</p>
+  </div>
+</div>
+
+<svg width="500" height="180" viewBox="0 0 500 180">
+  <!-- spectral space scatter -->
+  <rect x="40" y="10" width="420" height="150" fill="#fafafa" stroke="#dee2e6" rx="6"/>
+  <text x="250" y="28" font-size="12" fill="#333" text-anchor="middle" font-weight="600">谱嵌入空间 (k=32 维, 此处投影到 2D)</text>
+  <!-- cluster A -->
+  <circle cx="100" cy="80" r="5" fill="#4361ee" opacity="0.8"/>
+  <circle cx="115" cy="75" r="5" fill="#4361ee" opacity="0.8"/>
+  <circle cx="108" cy="95" r="5" fill="#4361ee" opacity="0.8"/>
+  <circle cx="125" cy="88" r="5" fill="#4361ee" opacity="0.7"/>
+  <circle cx="95" cy="90" r="5" fill="#4361ee" opacity="0.6"/>
+  <ellipse cx="108" cy="85" rx="30" ry="20" fill="none" stroke="#4361ee" stroke-dasharray="4,3" opacity="0.5"/>
+  <text x="108" y="120" font-size="10" fill="#4361ee" text-anchor="middle">Cluster A</text>
+  <!-- cluster B -->
+  <circle cx="230" cy="70" r="5" fill="#e63946" opacity="0.8"/>
+  <circle cx="245" cy="65" r="5" fill="#e63946" opacity="0.8"/>
+  <circle cx="238" cy="85" r="5" fill="#e63946" opacity="0.8"/>
+  <circle cx="255" cy="78" r="5" fill="#e63946" opacity="0.7"/>
+  <circle cx="222" cy="80" r="5" fill="#e63946" opacity="0.6"/>
+  <ellipse cx="238" cy="76" rx="30" ry="18" fill="none" stroke="#e63946" stroke-dasharray="4,3" opacity="0.5"/>
+  <text x="238" y="110" font-size="10" fill="#e63946" text-anchor="middle">Cluster B</text>
+  <!-- cluster C -->
+  <circle cx="360" cy="90" r="5" fill="#2a9d8f" opacity="0.8"/>
+  <circle cx="375" cy="85" r="5" fill="#2a9d8f" opacity="0.8"/>
+  <circle cx="368" cy="105" r="5" fill="#2a9d8f" opacity="0.8"/>
+  <circle cx="385" cy="98" r="5" fill="#2a9d8f" opacity="0.7"/>
+  <circle cx="352" cy="100" r="5" fill="#2a9d8f" opacity="0.6"/>
+  <ellipse cx="368" cy="96" rx="30" ry="18" fill="none" stroke="#2a9d8f" stroke-dasharray="4,3" opacity="0.5"/>
+  <text x="368" y="130" font-size="10" fill="#2a9d8f" text-anchor="middle">Cluster C</text>
+  <text x="250" y="155" font-size="10" fill="#888" text-anchor="middle">K-means 在谱空间聚类 → k = n_tokens / block_size 个 cluster</text>
+</svg>
+
+<div class="arrow-down">&#x25BC;</div>
+
+<div class="step-row">
+  <div class="step-num">4</div>
+  <div class="step-content">
+    <h3>重排: 同 cluster 的 token 连续放置</h3>
+    <p>每个 cluster 对应一或多个连续 block。topk 选中的 token 更多落在同一个 block 内 → block scatter 降低。</p>
+  </div>
+</div>
+
+<svg width="700" height="110" viewBox="0 0 700 110">
+  <text x="10" y="18" font-size="11" fill="#888">原始:</text>
+  <g transform="translate(60, 3)">
+    <rect x="0" y="0" width="600" height="22" rx="3" fill="#f1f3f5" stroke="#dee2e6"/>
+    <!-- scattered tokens -->
+    <rect x="10" y="2" width="8" height="18" rx="2" fill="#4361ee" opacity="0.7"/>
+    <rect x="50" y="2" width="8" height="18" rx="2" fill="#e63946" opacity="0.7"/>
+    <rect x="100" y="2" width="8" height="18" rx="2" fill="#2a9d8f" opacity="0.7"/>
+    <rect x="140" y="2" width="8" height="18" rx="2" fill="#4361ee" opacity="0.7"/>
+    <rect x="200" y="2" width="8" height="18" rx="2" fill="#e63946" opacity="0.7"/>
+    <rect x="260" y="2" width="8" height="18" rx="2" fill="#2a9d8f" opacity="0.7"/>
+    <rect x="310" y="2" width="8" height="18" rx="2" fill="#4361ee" opacity="0.7"/>
+    <rect x="380" y="2" width="8" height="18" rx="2" fill="#e63946" opacity="0.7"/>
+    <rect x="440" y="2" width="8" height="18" rx="2" fill="#2a9d8f" opacity="0.7"/>
+    <rect x="500" y="2" width="8" height="18" rx="2" fill="#4361ee" opacity="0.7"/>
+    <rect x="560" y="2" width="8" height="18" rx="2" fill="#e63946" opacity="0.7"/>
+  </g>
+  <text x="670" y="18" font-size="11" fill="#e63946" font-weight="600">散布</text>
+
+  <text x="35" y="48" font-size="16" fill="#adb5bd">&#x25BC;</text>
+
+  <text x="10" y="75" font-size="11" fill="#888">重排:</text>
+  <g transform="translate(60, 60)">
+    <rect x="0" y="0" width="600" height="22" rx="3" fill="#f1f3f5" stroke="#dee2e6"/>
+    <!-- block boundaries -->
+    <line x1="200" y1="-3" x2="200" y2="25" stroke="#adb5bd" stroke-dasharray="3,2"/>
+    <line x1="400" y1="-3" x2="400" y2="25" stroke="#adb5bd" stroke-dasharray="3,2"/>
+    <!-- clustered tokens -->
+    <rect x="10" y="2" width="8" height="18" rx="2" fill="#4361ee" opacity="0.8"/>
+    <rect x="30" y="2" width="8" height="18" rx="2" fill="#4361ee" opacity="0.8"/>
+    <rect x="50" y="2" width="8" height="18" rx="2" fill="#4361ee" opacity="0.8"/>
+    <rect x="70" y="2" width="8" height="18" rx="2" fill="#4361ee" opacity="0.8"/>
+    <rect x="220" y="2" width="8" height="18" rx="2" fill="#e63946" opacity="0.8"/>
+    <rect x="240" y="2" width="8" height="18" rx="2" fill="#e63946" opacity="0.8"/>
+    <rect x="260" y="2" width="8" height="18" rx="2" fill="#e63946" opacity="0.8"/>
+    <rect x="420" y="2" width="8" height="18" rx="2" fill="#2a9d8f" opacity="0.8"/>
+    <rect x="440" y="2" width="8" height="18" rx="2" fill="#2a9d8f" opacity="0.8"/>
+    <rect x="460" y="2" width="8" height="18" rx="2" fill="#2a9d8f" opacity="0.8"/>
+    <rect x="480" y="2" width="8" height="18" rx="2" fill="#2a9d8f" opacity="0.8"/>
+    <!-- block labels -->
+    <text x="100" y="38" font-size="10" fill="#4361ee" text-anchor="middle">Block 0 (Cluster A)</text>
+    <text x="300" y="38" font-size="10" fill="#e63946" text-anchor="middle">Block 3 (Cluster B)</text>
+    <text x="500" y="38" font-size="10" fill="#2a9d8f" text-anchor="middle">Block 6 (Cluster C)</text>
+  </g>
+  <text x="670" y="75" font-size="11" fill="#2a9d8f" font-weight="600">聚集</text>
+</svg>
+
+<div class="note">
+  <strong>为什么不能 online:</strong> 步骤 1 需要遍历所有 decode step 的 topk 选择来构建 W。Prefill 阶段还没有 decode，无法预知未来 query 会选中哪些 token pair。实验表明仅用 1 个 step 的 W 只减少 16% scatter（远不如 freq 的 50%）。
+</div>
+</div>
+
+<!-- ==================== Greedy CoOc ==================== -->
+<div class="diagram">
+<h2>方法 B: Greedy CoOc (贪心共选 block-filling)</h2>
+
+<div class="step-row">
+  <div class="step-num red">1</div>
+  <div class="step-content">
+    <h3>构建共选矩阵 W (同 Spectral)</h3>
+    <p>遍历所有 decode steps，统计 token pair 共选次数 → 稀疏对称矩阵 W。</p>
+  </div>
+</div>
+
+<div class="arrow-down">&#x25BC;</div>
+
+<div class="step-row">
+  <div class="step-num red">2</div>
+  <div class="step-content">
+    <h3>逐 block 贪心填充</h3>
+    <p>反复执行: 选频率最高的未分配 token 作为种子 → 用 sparse matvec 算所有候选与种子的共选亲和度 → top-k 一次填满整个 block。</p>
+  </div>
+</div>
+
+<svg width="700" height="340" viewBox="0 0 700 340">
+  <!-- title -->
+  <text x="350" y="18" font-size="12" fill="#333" text-anchor="middle" font-weight="600">贪心填充过程 (block_size = 4 示例)</text>
+
+  <!-- iteration 1: Block 0 -->
+  <rect x="20" y="30" width="310" height="135" rx="8" fill="#f0f4ff" stroke="#4361ee" stroke-width="1.5"/>
+  <text x="175" y="50" font-size="11" fill="#4361ee" text-anchor="middle" font-weight="600">Block 0</text>
+
+  <!-- seed -->
+  <text x="35" y="72" font-size="11" fill="#555">Seed: 频率最高 → token A</text>
+  <rect x="240" y="58" width="28" height="20" rx="4" fill="#4361ee"/>
+  <text x="254" y="72" font-size="10" fill="#fff" text-anchor="middle">A</text>
+
+  <!-- sparse matvec -->
+  <text x="35" y="98" font-size="11" fill="#555">W × indicator(A) → 亲和度分数</text>
+  <g transform="translate(35, 105)">
+    <rect x="0" y="0" width="40" height="14" rx="3" fill="#4361ee" opacity="0.8"/>
+    <text x="20" y="11" font-size="8" fill="#fff" text-anchor="middle">B: 15</text>
+    <rect x="48" y="0" width="40" height="14" rx="3" fill="#4361ee" opacity="0.6"/>
+    <text x="68" y="11" font-size="8" fill="#fff" text-anchor="middle">E: 12</text>
+    <rect x="96" y="0" width="40" height="14" rx="3" fill="#4361ee" opacity="0.4"/>
+    <text x="116" y="11" font-size="8" fill="#fff" text-anchor="middle">H: 9</text>
+    <rect x="144" y="0" width="40" height="14" rx="3" fill="#ccc" opacity="0.5"/>
+    <text x="164" y="11" font-size="8" fill="#666" text-anchor="middle">C: 2</text>
+    <rect x="192" y="0" width="40" height="14" rx="3" fill="#ccc" opacity="0.3"/>
+    <text x="212" y="11" font-size="8" fill="#666" text-anchor="middle">D: 1</text>
+    <text x="245" y="11" font-size="9" fill="#888">...</text>
+  </g>
+
+  <!-- top-k fill -->
+  <text x="35" y="140" font-size="11" fill="#555">Top-3 填入 →</text>
+  <g transform="translate(150, 126)">
+    <rect x="0" y="0" width="28" height="20" rx="4" fill="#4361ee"/><text x="14" y="14" font-size="10" fill="#fff" text-anchor="middle">A</text>
+    <rect x="34" y="0" width="28" height="20" rx="4" fill="#4361ee" opacity="0.8"/><text x="48" y="14" font-size="10" fill="#fff" text-anchor="middle">B</text>
+    <rect x="68" y="0" width="28" height="20" rx="4" fill="#4361ee" opacity="0.6"/><text x="82" y="14" font-size="10" fill="#fff" text-anchor="middle">E</text>
+    <rect x="102" y="0" width="28" height="20" rx="4" fill="#4361ee" opacity="0.4"/><text x="116" y="14" font-size="10" fill="#fff" text-anchor="middle">H</text>
+  </g>
+  <text x="300" y="152" font-size="10" fill="#4361ee">&#x2713;</text>
+
+  <!-- iteration 2: Block 1 -->
+  <rect x="370" y="30" width="310" height="135" rx="8" fill="#fff0f0" stroke="#e63946" stroke-width="1.5"/>
+  <text x="525" y="50" font-size="11" fill="#e63946" text-anchor="middle" font-weight="600">Block 1</text>
+
+  <text x="385" y="72" font-size="11" fill="#555">Seed: 剩余最热 → token C</text>
+  <rect x="590" y="58" width="28" height="20" rx="4" fill="#e63946"/>
+  <text x="604" y="72" font-size="10" fill="#fff" text-anchor="middle">C</text>
+
+  <text x="385" y="98" font-size="11" fill="#555">W × indicator(C) → 亲和度分数</text>
+  <g transform="translate(385, 105)">
+    <rect x="0" y="0" width="40" height="14" rx="3" fill="#e63946" opacity="0.8"/>
+    <text x="20" y="11" font-size="8" fill="#fff" text-anchor="middle">F: 14</text>
+    <rect x="48" y="0" width="40" height="14" rx="3" fill="#e63946" opacity="0.6"/>
+    <text x="68" y="11" font-size="8" fill="#fff" text-anchor="middle">D: 11</text>
+    <rect x="96" y="0" width="40" height="14" rx="3" fill="#e63946" opacity="0.4"/>
+    <text x="116" y="11" font-size="8" fill="#fff" text-anchor="middle">G: 8</text>
+    <rect x="144" y="0" width="40" height="14" rx="3" fill="#ccc" opacity="0.3"/>
+    <text x="164" y="11" font-size="8" fill="#666" text-anchor="middle">I: 1</text>
+    <text x="198" y="11" font-size="9" fill="#888">...</text>
+  </g>
+
+  <text x="385" y="140" font-size="11" fill="#555">Top-3 填入 →</text>
+  <g transform="translate(500, 126)">
+    <rect x="0" y="0" width="28" height="20" rx="4" fill="#e63946"/><text x="14" y="14" font-size="10" fill="#fff" text-anchor="middle">C</text>
+    <rect x="34" y="0" width="28" height="20" rx="4" fill="#e63946" opacity="0.8"/><text x="48" y="14" font-size="10" fill="#fff" text-anchor="middle">F</text>
+    <rect x="68" y="0" width="28" height="20" rx="4" fill="#e63946" opacity="0.6"/><text x="82" y="14" font-size="10" fill="#fff" text-anchor="middle">D</text>
+    <rect x="102" y="0" width="28" height="20" rx="4" fill="#e63946" opacity="0.4"/><text x="116" y="14" font-size="10" fill="#fff" text-anchor="middle">G</text>
+  </g>
+  <text x="650" y="152" font-size="10" fill="#e63946">&#x2713;</text>
+
+  <!-- repeat arrow -->
+  <text x="350" y="190" font-size="12" fill="#adb5bd" text-anchor="middle">重复直到所有 token 都分配到 block ...</text>
+
+  <!-- final result -->
+  <rect x="20" y="210" width="660" height="120" rx="8" fill="#f8fff8" stroke="#2a9d8f" stroke-width="1.5"/>
+  <text x="350" y="232" font-size="12" fill="#2a9d8f" text-anchor="middle" font-weight="600">最终重排结果</text>
+
+  <g transform="translate(50, 248)">
+    <!-- block 0 -->
+    <rect x="0" y="0" width="130" height="28" rx="5" fill="#4361ee" opacity="0.15" stroke="#4361ee" stroke-dasharray="3,2"/>
+    <rect x="5" y="4" width="26" height="20" rx="4" fill="#4361ee"/><text x="18" y="18" font-size="10" fill="#fff" text-anchor="middle">A</text>
+    <rect x="35" y="4" width="26" height="20" rx="4" fill="#4361ee" opacity="0.8"/><text x="48" y="18" font-size="10" fill="#fff" text-anchor="middle">B</text>
+    <rect x="65" y="4" width="26" height="20" rx="4" fill="#4361ee" opacity="0.6"/><text x="78" y="18" font-size="10" fill="#fff" text-anchor="middle">E</text>
+    <rect x="95" y="4" width="26" height="20" rx="4" fill="#4361ee" opacity="0.4"/><text x="108" y="18" font-size="10" fill="#fff" text-anchor="middle">H</text>
+    <text x="65" y="45" font-size="10" fill="#4361ee" text-anchor="middle">Block 0</text>
+
+    <!-- block 1 -->
+    <rect x="150" y="0" width="130" height="28" rx="5" fill="#e63946" opacity="0.12" stroke="#e63946" stroke-dasharray="3,2"/>
+    <rect x="155" y="4" width="26" height="20" rx="4" fill="#e63946"/><text x="168" y="18" font-size="10" fill="#fff" text-anchor="middle">C</text>
+    <rect x="185" y="4" width="26" height="20" rx="4" fill="#e63946" opacity="0.8"/><text x="198" y="18" font-size="10" fill="#fff" text-anchor="middle">F</text>
+    <rect x="215" y="4" width="26" height="20" rx="4" fill="#e63946" opacity="0.6"/><text x="228" y="18" font-size="10" fill="#fff" text-anchor="middle">D</text>
+    <rect x="245" y="4" width="26" height="20" rx="4" fill="#e63946" opacity="0.4"/><text x="258" y="18" font-size="10" fill="#fff" text-anchor="middle">G</text>
+    <text x="215" y="45" font-size="10" fill="#e63946" text-anchor="middle">Block 1</text>
+
+    <!-- block 2 -->
+    <rect x="300" y="0" width="130" height="28" rx="5" fill="#2a9d8f" opacity="0.12" stroke="#2a9d8f" stroke-dasharray="3,2"/>
+    <rect x="305" y="4" width="26" height="20" rx="4" fill="#2a9d8f"/><text x="318" y="18" font-size="10" fill="#fff" text-anchor="middle">I</text>
+    <rect x="335" y="4" width="26" height="20" rx="4" fill="#2a9d8f" opacity="0.8"/><text x="348" y="18" font-size="10" fill="#fff" text-anchor="middle">J</text>
+    <rect x="365" y="4" width="26" height="20" rx="4" fill="#2a9d8f" opacity="0.6"/><text x="378" y="18" font-size="10" fill="#fff" text-anchor="middle">K</text>
+    <rect x="395" y="4" width="26" height="20" rx="4" fill="#2a9d8f" opacity="0.4"/><text x="408" y="18" font-size="10" fill="#fff" text-anchor="middle">L</text>
+    <text x="365" y="45" font-size="10" fill="#2a9d8f" text-anchor="middle">Block 2</text>
+
+    <text x="450" y="18" font-size="14" fill="#adb5bd">...</text>
+  </g>
+
+  <text x="350" y="318" font-size="10" fill="#888" text-anchor="middle">经常共选的 token 在同一 block 内 → 一次 topk 选择只需访问少量 block</text>
+</svg>
+
+<div class="note">
+  <strong>与 Spectral 的区别:</strong> Spectral 用全局谱分解找最优 cluster，Greedy 逐块贪心填充直接最大化 block 内共选密度。Greedy 在 block 粒度指标上更优 (bs=64: scatter 5.0× vs spectral 7.2×)，但同样依赖完整 decode 历史的共选矩阵 W。
+</div>
+
+<div class="legend">
+  <div class="legend-item"><div class="legend-dot" style="background:#4361ee"></div>Cluster/Block A</div>
+  <div class="legend-item"><div class="legend-dot" style="background:#e63946"></div>Cluster/Block B</div>
+  <div class="legend-item"><div class="legend-dot" style="background:#2a9d8f"></div>Cluster/Block C</div>
+  <div class="legend-item"><div class="legend-dot" style="background:#ccc"></div>低亲和度 (不同 cluster)</div>
+</div>
+</div>
+
+</div>
+</body>
+</html>
