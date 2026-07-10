@@ -26,7 +26,12 @@ class IndexerTopkCapturer(BaseTopkCapturer):
         self.index_topk = index_topk
 
         attn_tp_size = get_attention_tp_size()
-        assert attn_tp_size == 1, "IndexerTopkCapturer now only supports DP attention"
+        if attn_tp_size != 1:
+            logger.warning(
+                "IndexerTopkCapturer running with attn_tp_size=%d (TP-only). "
+                "DSv4 indexer is replicated (ReplicatedLinear) so topk is identical per rank.",
+                attn_tp_size,
+            )
 
         # DP-attention capture is per-rank-local: each rank writes [:local_batch, ...]
         # to its own device_cache, so the buffer only needs to fit one rank's batch.

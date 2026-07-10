@@ -238,34 +238,146 @@
 
 ---
 
-## 6. 数据产物清单
+## 6. 1M 长上下文 Block Scatter 分析
+
+### 6.1 实验设置
+
+使用 InfiniteBench `longbook_qa_eng` 的自然文本 (小说/长文档) 拼接构造 ~1M token 请求:
+- **数据**: 5 条合成请求, 每条 990K tokens (拼接 2-4 篇不同的书, 截断到 990K 以适应 `max_position_embeddings=1048576`)
+- **数据来源**: `xinrongzhang2022/InfiniteBench` (HuggingFace)
+- **服务器配置**: dp=4, tp=4, dp-attention, `max_total_tokens=1050000` (每 rank 1.05M), indexer host buffer ~42 GB/rank
+- **C4 压缩 tokens**: 990K / 4 = ~247.5K per request
+
+### 6.2 Block Scatter 结果
+
+**1M 请求 (5 req × 21 layers, 3675 samples):**
+
+| bs | original | freq 排序 | 减少 | oracle | scatter(orig) | scatter(freq) |
+|---|---|---|---|---|---|---|
+| 16 | 326.7 | 153.8 | -53% | 32.0 | 10.2× | 4.8× |
+| 32 | 289.4 | 99.9 | -65% | 16.0 | 18.1× | 6.2× |
+| 64 | 252.3 | 61.2 | -76% | 8.0 | 31.5× | 7.7× |
+| 128 | 215.0 | 35.6 | -83% | 4.0 | 53.8× | 8.9× |
+
+### 6.3 1M vs 100K 对比
+
+| bs | 100K orig | 100K freq | 1M orig | 1M freq |
+|---|---|---|---|---|
+| 16 | 199.5 | 142.1 (-29%) | 326.7 | 153.8 (-53%) |
+| 32 | 150.5 | 89.9 (-40%) | 289.4 | 99.9 (-65%) |
+| 64 | 108.5 | 54.1 (-50%) | 252.3 | 61.2 (-76%) |
+| 128 | — | — | 215.0 | 35.6 (-83%) |
+
+### 6.4 关键发现
+
+1. **1M 下原始 scatter 急剧恶化**: bs=64 时从 100K 的 13.6× 飙到 **31.5×** (252 blocks vs 109), 因为 250K C4 token 分散在更多 block 里. 随机访存的代价随序列长度**超线性增长**.
+
+2. **频率排序在 1M 下效果更显著**: bs=64 减少 **76%** (vs 100K 时 50%), bs=128 减少 **83%**. 原因: 1M 序列中热 token (attention sink + 关键段落) 占比更小、冷 token 比例更高 → 频率排序的"热前冷后"策略获益更大.
+
+3. **freq reorder 后的绝对 block 数在 1M 和 100K 间差距不大** (bs=64: 61 vs 54), 说明频率排序有效地把 1M 的 scatter 压到接近 100K 水平. 这意味着: 长上下文下频率排序几乎消除了因序列变长而新增的 scatter.
+
+4. **bs=128 是 1M 下的甜点**: 原始 215→freq 35.6 (-83%), scatter 从 53.8×→8.9×. 大 block + 频率排序的组合在超长上下文下优势最大.
+
+5. **结论**: 频率排序对长上下文的价值**随序列长度单调递增** — 100K 减 50%, 1M 减 76-83%. 这使得它不仅是"有用的优化", 而是**长上下文 serving 的必要机制**.
+
+---
+
+## 7. DSv32 (DeepSeek-V3.2) Block Scatter 分析
+
+### 7.1 模型差异
+
+| 参数 | dsv4f (DSv4) | dsv32 (DSA) |
+|---|---|---|
+| 架构 | DeepseekV4ForCausalLM | DeepseekV32ForCausalLM |
+| 总层数 | 43 | 61 |
+| indexer 层数 | 21 (C4 层) | 61 (所有层) |
+| index_topk | 512 | 2048 |
+| compress_ratio | 4 (C4) / 128 (C128) | 无 (直接 MLA KV) |
+| max context | 1048576 (1M) | 163840 (~164K) |
+
+### 7.2 实验设置
+
+- **数据**: LongBench-v2 前 100 条, 其中 34 条 ≤44K tokens 成功 (dsv32 GPU 显存限制 max_total_num_tokens=44864)
+- **配置**: dp=4, tp=4, dp-attention, `--enable-return-indexer-topk`
+- **样本**: 34 req × 61 layers = 2074 samples
+- **prompt 范围**: 11K–44K tokens
+
+### 7.3 Block Scatter 结果
+
+| bs | original | freq 排序 | oracle | scatter(orig) | scatter(freq) |
+|---|---|---|---|---|---|
+| 16 | 621.6 | 125.1 (-80%) | 125.1 | 5.0× | **1.0×** |
+| 32 | 420.5 | 63.0 (-85%) | 63.0 | 6.7× | **1.0×** |
+| 64 | 266.4 | 32.0 (-88%) | 32.0 | 8.3× | **1.0×** |
+| 128 | 157.4 | 16.0 (-90%) | 16.0 | 9.8× | **1.0×** |
+
+### 7.4 与 dsv4f 的对比
+
+| bs | dsv4f orig | dsv4f freq (scatter) | dsv32 orig | dsv32 freq (scatter) |
+|---|---|---|---|---|
+| 16 | 199.5 | 142.1 (4.4×) | 621.6 | 125.1 (**1.0×**) |
+| 32 | 150.5 | 89.9 (5.6×) | 420.5 | 63.0 (**1.0×**) |
+| 64 | 108.5 | 54.1 (6.8×) | 266.4 | 32.0 (**1.0×**) |
+| 128 | — | — | 157.4 | 16.0 (**1.0×**) |
+
+### 7.5 关键发现
+
+1. **dsv32 上频率排序达到了理论最优 (scatter = 1.0×)**. 频率排序后 topk 选中的 2048 个 token 恰好只占 `ceil(2048/bs)` 个 block, 零浪费. 这在 dsv4f 上从未达到 (scatter 6.8×).
+
+2. **根本原因: topk 稀疏度**. dsv32 的 `index_topk=2048` 远大于 dsv4f 的 512, 每步选中的 token 占总序列比例更高 (2048/30K ≈ 7% vs 512/25K ≈ 2%). 最热的 2048 个 token 几乎每步都被全部选中 → 频率排序后前 2048 个位置 = 每步的 topk → 完美连续.
+
+3. **稀疏度越低, 重排越有效**. 这是因为:
+   - **高稀疏度 (dsv4f, 2%)**: 不同 step 的 topk 变化大, 热 token 集合不稳定, 频率排序只能聚集"经常热"的子集, 每步仍有大量"偶尔热"的 token 散落在冷区 → scatter > 1.
+   - **低稀疏度 (dsv32, 7%)**: topk 覆盖了大部分"值得关注"的 token, 不同 step 的选择高度重叠 (因为选得多 → 差异小), 频率排序几乎等于 oracle.
+
+4. **原始 scatter 对比**: dsv32 原始 scatter (5.0-9.8×) 反而低于 dsv4f (6.2-13.6×), 尽管 dsv32 选更多 token (2048 vs 512). 这是因为 2048 个 token 的"覆盖密度"更高 — 随机选 2048/30K 本身就比 512/25K 更"连续"(落入同一 block 的概率更高).
+
+5. **对 dsv4f 优化的启示**: 如果 dsv4f 能在不损失注意力质量的前提下增大 `index_topk` (如从 512 增到 1024 或 2048), 频率排序的效果会大幅提升, 逼近 oracle. 这是一个**算法-系统联合优化**的方向: 用少量额外计算 (选更多 token) 换取大幅减少的内存访问 scatter.
+
+---
+
+## 8. 数据产物清单
 
 | 文件 | 说明 |
 |---|---|
-| `dsv4f-topk/req_XXXX.npz` | 100 个 topk index (decode-only) |
-| `dsv4f-topk/kv_dump/req_{rid}.pt` | 100 个 C4 KV + indexer K (全序列) |
-| `dsv4f-topk/manifest.jsonl` | 请求元数据 |
+| `dsv4f-topk/req_XXXX.npz` | 100 个 topk index, dsv4f ~100K 请求 (decode-only) |
+| `dsv4f-topk/kv_dump/req_{rid}.pt` | 100 个 C4 KV + indexer K, dsv4f ~100K 请求 |
+| `dsv4f-topk/topk_1m/req_XX.npz` | 5 个 topk index, dsv4f ~1M 请求 (decode-only) |
+| `dsv4f-topk/kv_dump_1m/req_{rid}.pt` | 5 个 C4 KV + indexer K, dsv4f ~1M 请求 |
+| `dsv4f-topk/dsv32_topk/req_XXXX.npz` | 34 个 topk index, dsv32 ~11-44K 请求 |
+| `dsv4f-topk/dsv32_topk/block_scatter.json` | dsv32 block scatter 分析结果 |
+| `dsv4f-topk/manifest.jsonl` | dsv4f 100K 请求元数据 |
+| `dsv4f-topk/topk_1m/manifest.jsonl` | dsv4f 1M 请求元数据 |
+| `dsv4f-topk/dsv32_topk/manifest.jsonl` | dsv32 请求元数据 |
 | `dsv4f-topk/hisparse_sim_results.json` | hisparse 命中率模拟 |
 | `dsv4f-topk/hitrate_by_len_and_buffer.csv` | 命中率 vs 长度 × buffer size |
 | `dsv4f-topk/hitrate_by_buffer.png` | 命中率可视化 (2×3 子图) |
 | `dsv4f-topk/layer_topk_similarity.json/png` | 相邻层相似性 |
 | `dsv4f-topk/inter_request_coselection.json/png` | 跨请求共选 |
 | `dsv4f-topk/reorder_all_methods_full.json` | 6 种重排方法对比 |
+| `dsv4f-topk/reorder_warmup_steps.json` | warmup-step 实验 |
 
 ---
 
-## 7. 分析脚本清单
+## 8. 分析脚本清单
 
 | 脚本 | 说明 |
 |---|---|
-| `run_dsv4f_indexer_capture.py` | 客户端: 发 100 条请求, 收 topk index |
+| `run_dsv4f_indexer_capture.py` | 客户端: 发 100 条 ~100K 请求, 收 topk index |
+| `dsv4f-topk/build_1m_requests.py` | 构造 ~1M 合成请求 (拼接 InfiniteBench 长文档) |
+| `dsv4f-topk/run_1m_capture.py` | 客户端: 发 5 条 ~1M 请求, 收 topk index |
 | `sim_hisparse_hitrate.py` | hisparse LRU 缓存命中率模拟器 |
-| `analyze_reorder_feasibility.py` | 重排可行性初步分析 |
 | `analyze_reorder_all_full.py` | 6 种重排方法全量对比 (GPU 加速) |
-| `analyze_kmeans_reorder.py` | K-means 重排分析 |
+| `analyze_warmup_steps.py` | warmup-step 实验 |
 
 ### Runtime 改动 (可 revert)
 
 `python/sglang/srt/managers/scheduler_components/batch_result_processor.py`:
 - `_maybe_collect_indexer_topk`: 加 `start_len=prompt_len-1` (decode-only topk)
 - `_maybe_dump_kv_to_disk`: 新增, 读 `SGLANG_DUMP_KV_DIR` 环境变量, 为完成的请求 dump C4 KV + indexer K 到磁盘
+
+`python/sglang/srt/state_capturer/indexer_topk.py`:
+- `IndexerTopkCapturer.__init__`: 放松 `assert attn_tp_size == 1` 为 warning (DSv4 indexer 是 ReplicatedLinear, TP-only 下 topk 也正确)
+
+`python/sglang/srt/entrypoints/engine.py`:
+- sgl-kernel 版本要求从 0.4.4 降到 0.4.3 (兼容当前环境)
