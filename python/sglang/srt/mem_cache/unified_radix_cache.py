@@ -471,9 +471,6 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         self.evictable_device_leaves: set[UnifiedTreeNode] = set()
         self.evictable_host_leaves: set[UnifiedTreeNode] = set()
-        # Debug-only: set to N to run sanity_check() every N event rounds.
-        self._sanity_interval = 0
-        self._sanity_counter = 0
         # Order-sensitive rolling signature of rank-local write-back drop
         # decisions (folds node id + token count per event); cross-checked
         # across ranks in writing_check. Covers every _wb_drop_allowed
@@ -1482,14 +1479,10 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         self._update_evictable_leaf_sets(node)
 
     def _remove_leaf_from_parent(self, node: UnifiedTreeNode):
-        # TODO(upstream): hardening over upstream's bare `assert v == node`,
-        # which (a) gives zero forensic context, (b) fires AFTER the pop
-        # already detached whatever occupied the slot (collateral damage
-        # when v is a different node), and (c) is stripped under `python
-        # -O`, letting tree corruption proceed silently. Restore-then-raise
-        # keeps the pre-error state intact for the dump. Candidate for an
-        # upstream diagnosability PR together with sanity_check's stale
-        # host-leaf detail dump.
+        # TODO(upstream): forensic replacement for upstream's bare
+        # `assert v == node` — that assert has no context, detaches an
+        # innocent occupant before firing, and is stripped under -O.
+        # Restore-then-raise keeps the pre-error state intact for the dump.
         key = node.key.child_key(self.page_size)
         v = node.parent.children.pop(key, None)
         if v is not node:
@@ -1727,31 +1720,20 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         dropping the node's device data. False = vetoed, skip the node.
 
         Host pool saturated (write_backup already tried evict_host
-        internally): drop the device data instead of stalling. Only
-        cached data is lost; keeping device eviction always realizable
-        is what lets the scheduler trust evictable_size() without
-        host-feasibility accounting (which starves under deep chained
-        trees).
+        internally): drop the device data instead of stalling — only
+        cached data is lost, and keeping device eviction always
+        realizable lets the scheduler trust evictable_size().
 
-        TODO(upstream): the silent-stall it replaces is a latent
-        UPSTREAM write_back bug, not HiSparse-V2-specific — a failed
-        backup used to return without evicting while evictable_size()
-        still counted the node, so the scheduler budget was lied to and
-        allocation died with "Prefill out of memory". V2 only makes it
-        easy to hit (early unlock → large un-backuped evictable sets +
-        host saturation). The drop fallback plus
-        _delete_unreachable_host_subtree (its required companion — see
-        the orphaned-leaf-set hazard) belong upstream, where they are
-        even simpler: without V2's early unlock, evictable nodes are
-        never referenced by running requests, so no veto is needed.
-        Only the two vetoes here are V2-specific.
+        TODO(upstream): the silent stall this replaces is a latent
+        upstream write_back bug (failed backup returned without evicting
+        while evictable_size() still counted the node → "Prefill out of
+        memory"); V2's early unlock merely makes it easy to hit. The
+        drop fallback + _delete_unreachable_host_subtree belong upstream.
 
-        Veto the drop when it would NOT be cache-only: (a) the node
-        backs an active V2 request's prefix (a copy-less drop masks its
-        live attention positions), or (b) a descendant holds a host
-        lock (its host slots are referenced by a live request's
-        host_locs). Both are rare once V2 admission is host-capacity
-        gated; the node is skipped and the eviction pass moves on.
+        Vetoes (V2-specific; the drop must stay cache-only): (a) the
+        node backs an active V2 request's prefix (a copy-less drop masks
+        live attention positions); (b) a descendant holds a host lock
+        (its host slots are referenced by a live request's host_locs).
         """
         # Fold this drop decision into the rolling cross-rank signature
         # (checked in writing_check): node id + token count, order-sensitive.
@@ -2798,25 +2780,15 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                     break
                 finish_count += 1
 
-        # Piggyback a divergence probe on the existing collective:
-        # write_backup outcomes should be SPMD-deterministic (host pool
-        # state only mutates on symmetric paths), so the order-sensitive
-        # signature of fallback events must be identical on all ranks.
-        # min != max ⇒ the radix trees have forked — fail loud before
-        # the desync surfaces as an undebuggable collective hang. This
-        # is DETECTION (bounded by one scheduling interval), not
-        # prevention: original HiCache relies on the same symmetry
-        # invariant with no detection at all, and synchronizing every
-        # write decision would add collectives to the eviction path
-        # (the proven deadlock source). Zero extra collectives (same
-        # tensor, 3 elements instead of 1).
-        #
-        # TODO(upstream): upstream's MIN-reduce here only absorbs ack
-        # completion-TIMING divergence and silently assumes write
-        # DECISION content is rank-identical; a real fork manifests as
-        # an undebuggable collective hang. This probe is the first
-        # continuous check of that invariant — upstream-worthy as a
-        # hardening PR independent of HiSparse.
+        # Piggyback a divergence probe on the existing collective (same
+        # tensor, 3 elements instead of 1, zero extra collectives):
+        # write_backup outcomes must be SPMD-deterministic, so the
+        # order-sensitive signature of wb-drop events must be identical
+        # on all ranks; min != max ⇒ the radix trees have forked — fail
+        # loud before the desync surfaces as a collective hang.
+        # TODO(upstream): upstream's MIN-reduce only absorbs ack TIMING
+        # divergence and assumes write-DECISION symmetry unchecked; this
+        # probe is upstream-worthy hardening independent of HiSparse.
         probe = torch.tensor(
             [finish_count, self._wb_fallback_sig, -self._wb_fallback_sig],
             dtype=torch.int64,
@@ -2936,11 +2908,6 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         self._drain_async_work()
         self.writing_check()
         self.loading_check()
-        if self._sanity_interval > 0:
-            self._sanity_counter += 1
-            if self._sanity_counter >= self._sanity_interval:
-                self._sanity_counter = 0
-                self.sanity_check()
         if self.enable_storage:
             self.drain_storage_control_queues()
         if self.enable_storage_metrics and self.storage_metrics_collector is not None:
