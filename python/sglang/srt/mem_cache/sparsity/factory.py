@@ -116,6 +116,91 @@ def parse_hisparse_config(server_args) -> SparseConfig:
     return _parse_sparse_config(server_args)
 
 
+def hisparse_v2_expansion_ratio(server_args) -> float:
+    """Expanded indexer region size as a multiple of the attention pool
+    (in tokens): expanded_tokens = ratio * max_total_num_tokens.
+
+    Explicit override: hisparse_config {"expansion_ratio": R}. Default is
+    1 + hicache_ratio — admitted prefixes can span at most the device
+    pool (1x) plus what the host pool can hold of displaced attention KV
+    (hicache_ratio x), so a larger region is unreachable and a smaller
+    one makes the expanded region the binding constraint before host
+    capacity. Both DefaultPoolConfigurator (budget cell) and
+    KVCacheConfigurator (index_buf_size) MUST derive from this single
+    helper, or the capacity accounting splits (P1-2 class bug).
+    """
+    cfg = _parse_sparse_config(server_args)
+    ratio = cfg.sparse_extra_config.get("expansion_ratio")
+    if ratio is not None:
+        ratio = float(ratio)
+        if ratio <= 0:
+            raise ValueError(f"expansion_ratio must be > 0, got {ratio}")
+        return ratio
+    if getattr(server_args, "hicache_size", 0):
+        logger.warning(
+            "HiSparse V2: --hicache-size is set, so the default expanded "
+            "indexer sizing (1 + hicache_ratio = %.1f) may not match the "
+            "actual host capacity; set hisparse_config expansion_ratio "
+            "explicitly.",
+            1.0 + server_args.hicache_ratio,
+        )
+    return 1.0 + float(server_args.hicache_ratio)
+
+
+def hisparse_v2_top_k(server_args, model_config) -> int:
+    """The operative V2 decode top-k: the model's ``index_topk`` when
+    present (the coordinator sizes per-request temp slots with it and the
+    DSA backend selects that many positions), else hisparse_config.top_k.
+
+    Capacity sizing (coordinator overhead, max_running_requests clamp)
+    MUST use this same value — sizing from a diverging config top_k
+    underestimates coordinator memory and inflates the request clamp.
+    """
+    cfg = _parse_sparse_config(server_args)
+    model_top_k = getattr(model_config.hf_text_config, "index_topk", None)
+    if model_top_k is None:
+        return cfg.top_k
+    if int(model_top_k) != cfg.top_k:
+        raise ValueError(
+            f"HiSparse V2: hisparse_config top_k={cfg.top_k} differs from the "
+            f"model's index_topk={int(model_top_k)}. The DSA indexer always "
+            f"selects index_topk positions, which governs temp-slot sizing "
+            f"and capacity accounting; remove top_k from hisparse_config or "
+            f"set it to {int(model_top_k)}."
+        )
+    return int(model_top_k)
+
+
+def hisparse_v2_device_buffer_tokens(server_args, model_config) -> int:
+    """Per-request temp device-buffer size in tokens — V1's
+    ``device_buffer_size`` knob (hisparse_config field), but with a V2
+    default of ``top_k`` (1x): on hardware with ample host-DMA bandwidth
+    the 2x buffer showed no end-to-end gain and a regression on
+    near-pool-capacity workloads (see the doc's device_buffer_size A/B),
+    so V2 only grows the buffer when the field is set explicitly. V1
+    keeps its own 2*top_k parser default.
+
+    This is the V2 request's lifetime device floor: admission allocates
+    this many regular-pool tokens and the swap-in hit cache retains
+    residents across steps in them. Capacity sizing (coordinator
+    overhead, max_running_requests clamp, scheduler reservation via
+    ``coordinator.temp_slot_tokens``) MUST derive from this same value.
+    The coordinator additionally validates page alignment and
+    power-of-2 (tl.arange slot vectors).
+    """
+    _parse_sparse_config(server_args)  # config validation (clear errors)
+    top_k = hisparse_v2_top_k(server_args, model_config)
+    raw = (
+        json.loads(server_args.hisparse_config)
+        if server_args.hisparse_config
+        else {}
+    )
+    explicit = raw.get("device_buffer_size")
+    if explicit is None:
+        return top_k
+    return max(int(explicit), top_k)
+
+
 def create_sparse_coordinator(
     device: torch.device,
     req_to_token_pool,

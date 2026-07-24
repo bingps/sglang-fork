@@ -135,3 +135,109 @@ def validate_hisparse(server_args: ServerArgs) -> None:
         ("dsa_decode_backend", "decode"),
     ]:
         validate_hisparse_dsa_backend(server_args, attr, label)
+
+
+def validate_hisparse_v2(server_args: ServerArgs) -> None:
+    """Validate --enable-hisparse-v2 constraints."""
+    if not server_args.enable_hisparse_v2:
+        return
+
+    if server_args.enable_hisparse:
+        raise ValueError(
+            "--enable-hisparse and --enable-hisparse-v2 are mutually exclusive. "
+            "Use --enable-hisparse-v2 for the HiCache-backed variant."
+        )
+
+    from sglang.srt.configs.model_config import is_deepseek_dsa
+
+    hf_config = server_args.get_model_config().hf_config
+    if not is_deepseek_dsa(hf_config):
+        raise ValueError(
+            "--enable-hisparse-v2 currently only supports DSA "
+            "(DeepSeek Sparse Attention) models (e.g., DeepSeek V3.2, GLM-5)."
+        )
+
+    if not server_args.enable_hierarchical_cache:
+        raise ValueError(
+            "--enable-hisparse-v2 requires --enable-hierarchical-cache "
+            "(HiCache is the logical pool for HiSparse V2)."
+        )
+
+    if server_args.disable_radix_cache:
+        raise ValueError(
+            "--enable-hisparse-v2 requires radix cache. "
+            "--disable-radix-cache is incompatible because V2 uses "
+            "UnifiedRadixCache for KV lifecycle management."
+        )
+
+    if server_args.hicache_write_policy != "write_back":
+        raise ValueError(
+            "--enable-hisparse-v2 requires --hicache-write-policy write_back. "
+            f"Got '{server_args.hicache_write_policy}'. V2 relies on evicted "
+            "nodes retaining host_value, which only write_back guarantees."
+        )
+
+    if server_args.speculative_algorithm is not None:
+        raise ValueError(
+            "--enable-hisparse-v2 does not support speculative decoding yet: "
+            "the dual-source swap-in only covers the decode path, and "
+            "TARGET_VERIFY / draft-extend page tables are not V2-aware, so "
+            "evicted positions would reach attention as invalid locations."
+        )
+
+    if server_args.enable_mixed_chunk:
+        raise ValueError(
+            "--enable-hisparse-v2 does not support --enable-mixed-chunk: "
+            "MIXED batches route decode requests through forward_extend, "
+            "which has neither the expanded indexer page table nor the "
+            "dual-source swap-in, so evicted prefixes would reach the "
+            "kernels as -1 sentinels."
+        )
+
+    if server_args.enable_streaming_session or server_args.enable_session_radix_cache:
+        raise ValueError(
+            "--enable-hisparse-v2 does not support streaming sessions: "
+            "session slots retain req_to_token rows and last_node lock "
+            "ownership across turns, which conflicts with V2's "
+            "admission-time lock release and eviction lifecycle (stale "
+            "device indices after idle-period eviction; double lock "
+            "release at session release)."
+        )
+
+    if server_args.disaggregation_mode != "null":
+        raise ValueError(
+            "--enable-hisparse-v2 does not support PD disaggregation: the "
+            "decode transfer/admission path never enters V2 admission, so "
+            "the configuration would silently degrade to standard decode "
+            "while pool sizing and request clamps assume V2 footprints."
+        )
+
+    if server_args.pp_size > 1:
+        raise ValueError(
+            "--enable-hisparse-v2 does not support pipeline parallelism "
+            "(pp_size > 1) yet: the write-back fallback divergence probe "
+            "only validates PP stage 0 (downstream stages inherit stage "
+            "0's reduced value), and the V2 eviction/swap-in lifecycle is "
+            "untested across PP stages."
+        )
+
+    if server_args.hicache_mem_layout not in ("page_first", "layer_first"):
+        raise ValueError(
+            "--enable-hisparse-v2 requires --hicache-mem-layout page_first "
+            f"or layer_first. Got '{server_args.hicache_mem_layout}': for "
+            "page_first_direct, MLATokenToKVPoolHost.data_refs indexes pages "
+            "rather than layers, so the V2 swap-in kernel would read host KV "
+            "from wrong addresses."
+        )
+
+    from sglang.srt.arg_groups.overrides import resolved_view
+
+    kv_cache_dtype = resolved_view(server_args).kv_cache_dtype
+    if kv_cache_dtype not in ("bfloat16", "auto", "fp8_e4m3"):
+        validate_hisparse_kv_cache_dtype(server_args)
+
+    for attr, label in [
+        ("dsa_prefill_backend", "prefill"),
+        ("dsa_decode_backend", "decode"),
+    ]:
+        validate_hisparse_dsa_backend(server_args, attr, label)

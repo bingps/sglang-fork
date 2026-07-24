@@ -1252,7 +1252,8 @@ def _dsa_kv_cache_dtype_default(view: Any) -> dict:
 def _dsa_split_backend_resolution(view: Any) -> dict:
     """Slot pass in the DSA arm: default the DSA prefill/decode split
     backends from the mid-resolution kv-cache dtype and the device
-    capability. The hisparse arm takes precedence under --enable-hisparse."""
+    capability. The hisparse arm takes precedence under
+    --enable-hisparse / --enable-hisparse-v2."""
     from sglang.srt.configs.model_config import is_deepseek_dsa
 
     hf_config = view.get_model_config().hf_config
@@ -1271,7 +1272,7 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
     user_set_decode = view.dsa_decode_backend is not None
     declared: Dict[str, Any] = {}
 
-    if view.enable_hisparse:
+    if view.enable_hisparse or view.enable_hisparse_v2:
         from sglang.srt.arg_groups.hisparse_hook import _hisparse_default_backend
 
         backend = _hisparse_default_backend(kv_cache_dtype)
@@ -1793,9 +1794,13 @@ def _hisparse_validation(view: Any) -> dict:
     """Read-only validation pass: --enable-hisparse constraints (model class,
     radix cache, kv dtype, DSA backends) read the resolved values through the
     view."""
-    from sglang.srt.arg_groups.hisparse_hook import validate_hisparse
+    from sglang.srt.arg_groups.hisparse_hook import (
+        validate_hisparse,
+        validate_hisparse_v2,
+    )
 
     validate_hisparse(view)
+    validate_hisparse_v2(view)
     return {}
 
 

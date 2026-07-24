@@ -471,6 +471,17 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         self.evictable_device_leaves: set[UnifiedTreeNode] = set()
         self.evictable_host_leaves: set[UnifiedTreeNode] = set()
+        # Debug-only: set to N to run sanity_check() every N event rounds.
+        self._sanity_interval = 0
+        self._sanity_counter = 0
+        # Order-sensitive rolling signature of rank-local write-back drop
+        # decisions (folds node id + token count per event); cross-checked
+        # across ranks in writing_check. Covers every _wb_drop_allowed
+        # call, including the HiSparse V2 finish-salvage path (probe blind
+        # spot otherwise: a salvage that succeeds on one rank and hits
+        # host-full on another silently forks tree state). Detects not
+        # just different event counts but same-count-different-node forks.
+        self._wb_fallback_sig = 0
         self.host_lru_lists = {
             ct: UnifiedLRUList(ct, self.tree_components, use_host_ptr=True)
             for ct in self.tree_components
@@ -722,6 +733,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
     ) -> None:
         if self.session.try_cache_finished_req(req, is_insert=is_insert, **kwargs):
             return
+        if self._hisparse_v2_try_cache_finished_req(req, is_insert, kv_len_to_handle):
+            return
 
         if self.disable:
             kv_indices = self.req_to_token_pool.req_to_token[
@@ -780,16 +793,170 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         else:
             self.token_to_kv_pool_allocator.free(kv_indices[req.cache_protected_len :])
 
-        self.dec_lock_ref(
-            req.last_node,
-            DecLockRefParams(swa_uuid_for_lock=getattr(req, "swa_uuid_for_lock", None)),
-            skip_swa=getattr(req, "swa_prefix_lock_released", False),
-        )
+        if not req._hisparse_v2_unlocked:
+            # HiSparse V2 fall-through: the device lock was already released at
+            # admission — releasing again would corrupt lock_ref.
+            self.dec_lock_ref(
+                req.last_node,
+                DecLockRefParams(swa_uuid_for_lock=getattr(req, "swa_uuid_for_lock", None)),
+                skip_swa=getattr(req, "swa_prefix_lock_released", False),
+            )
 
         # cleanup
         for comp in self._components_tuple:
             comp.cleanup_after_caching_req(
                 req, is_finished=True, insert_result=result, insert_params=insert_params
+            )
+
+    def _hisparse_v2_try_cache_finished_req(
+        self, req: Req, is_insert: bool, kv_len_to_handle: int
+    ) -> bool:
+        """HiSparse V2 arm of cache_finished_req; True = fully handled here.
+
+        The page-aligned prefix [0, cache_protected_len) is owned by the
+        radix tree and managed by HiCache eviction (its lock was released
+        at admission — cache_finished_req must never dec_lock_ref again;
+        see the `_hisparse_v2_unlocked` guard there).
+
+        If the prefix is still fully device-resident (no eviction
+        sentinel), return False so the standard insert path runs and the
+        decode output becomes a reusable prefix (multi-turn). This is safe
+        only without sentinels: _insert_helper's dedup-free and
+        _unevict_node_on_insert would otherwise consume -1 values.
+
+        If any prefix page was evicted (sentinel present), the standard
+        insert cannot run — but the request-owned tail is still valid
+        device KV, so salvage it as a HOST node under the demoted prefix
+        (see _hisparse_v2_cache_decode_output).
+        """
+        if not req._hisparse_v2_unlocked:
+            return False
+        kv_indices_full = self.req_to_token_pool.req_to_token[
+            req.req_pool_idx, :kv_len_to_handle
+        ]
+        prefix_intact = is_insert and not bool(
+            (kv_indices_full[: req.cache_protected_len] < 0).any().item()
+        )
+        if prefix_intact:
+            return False
+        if is_insert:
+            self._hisparse_v2_cache_decode_output(
+                req, kv_indices_full, kv_len_to_handle
+            )
+        else:
+            # clone() because allocator.free may defer into a free-group
+            # holding a reference while this req_to_token row is reused
+            # by a new request.
+            to_free = kv_indices_full[req.cache_protected_len :].clone()
+            if len(to_free) > 0:
+                self.token_to_kv_pool_allocator.free(to_free)
+        for comp in self._components_tuple:
+            comp.cleanup_after_caching_req(req, is_finished=True)
+        return True
+
+    def _descend_by_keys(self, key: RadixKey) -> tuple[UnifiedTreeNode, int]:
+        """Descend from root matching *key* against node keys only — never
+        reads or writes KV values (safe across evicted nodes, unlike
+        _insert_helper's walk). Splits partial matches. Returns the deepest
+        node covering the matched span and the matched token length."""
+        node = self.root_node
+        matched = 0
+        if len(key) == 0:
+            return node, 0
+        child_key = key.child_key(self.page_size)
+        while len(key) > 0 and child_key in node.children:
+            node = node.children[child_key]
+            prefix_len = node.key.match(key, page_size=self.page_size)
+            key = key[prefix_len:]
+            matched += prefix_len
+            if prefix_len < len(node.key):
+                node = self._split_node(node.key, node, prefix_len)
+                break
+            if len(key):
+                child_key = key.child_key(self.page_size)
+        return node, matched
+
+    def _hisparse_v2_cache_decode_output(
+        self, req: Req, kv_indices_full: torch.Tensor, kv_len_to_handle: int
+    ) -> None:
+        """Salvage decode-output reuse when the HiSparse V2 protected prefix has
+        eviction holes (sentinel -1 in req_to_token).
+
+        The request-owned tail [cache_protected_len, kv_len) is still valid
+        device KV even though the standard insert cannot run (it would
+        consume the -1 sentinels). Attach it under the (host-backed) prefix
+        chain as a HOST node: create a device child and hand it to
+        _evict_device_leaf, which write_backups and demotes it (or, on host
+        saturation, deletes it via the wb-drop path — sharing its
+        divergence-probe fold, vetoes, and KV-event bookkeeping). The
+        transient device-under-host state would mis-splice match_prefix's
+        device_indices, but it is unobservable: the scheduler thread runs
+        this to completion before any match. Falls back to plain free when
+        the walk comes up short — behavior then matches the old skip path.
+        """
+        protected = req.cache_protected_len
+
+        def _free_from(start: int) -> None:
+            # clone(): allocator.free may defer into a free-group holding a
+            # reference while this req_to_token row is reused.
+            t = kv_indices_full[start:kv_len_to_handle].clone()
+            if len(t) > 0:
+                self.token_to_kv_pool_allocator.free(t)
+
+        token_ids = (req.origin_input_ids + req.output_ids)[:kv_len_to_handle]
+        radix_key = RadixKey(
+            token_ids, req.extra_key, is_bigram=self.is_eagle
+        ).page_aligned(self.page_size)
+        aligned_len = len(radix_key)
+        if aligned_len <= protected:
+            _free_from(protected)
+            return
+        # The request-owned span must be hole-free (decode tokens are never
+        # evicted); anything else means unexpected state — conservative free.
+        own = kv_indices_full[protected:aligned_len]
+        if bool((own < 0).any().item()):
+            _free_from(protected)
+            return
+
+        node, matched = self._descend_by_keys(radix_key)
+        if matched < protected:
+            # Our own protected prefix is (partially) gone from the tree —
+            # cannot attach a suffix without its prefix chain.
+            _free_from(protected)
+            return
+
+        # Unaligned tail is never cacheable.
+        if kv_len_to_handle > aligned_len:
+            self.token_to_kv_pool_allocator.free(
+                kv_indices_full[aligned_len:kv_len_to_handle].clone()
+            )
+        # Dedup: [protected, matched) already lives in the tree — free ours.
+        if matched > protected:
+            self.token_to_kv_pool_allocator.free(
+                kv_indices_full[protected:matched].clone()
+            )
+        if matched >= aligned_len:
+            return
+
+        suffix_key = radix_key[matched:]
+        suffix_vals = kv_indices_full[matched:aligned_len].to(
+            dtype=torch.int64, copy=True
+        )
+        new_node = self._add_new_node(
+            node, suffix_key, suffix_vals, priority=getattr(req, "priority", 0) or 0
+        )
+
+        # Reuse the eviction path wholesale: write_backup → demote on
+        # success; _wb_drop_allowed → full delete on host-full (the drop
+        # vetoes are vacuously true for this fresh, request-private leaf).
+        tracker = {ct: 0 for ct in self.tree_components}
+        self._evict_device_leaf(new_node, tracker)
+        if new_node.backuped and new_node.evicted:
+            logger.info(
+                "HiSparse V2 finish: host-cached %d decode-output tokens under a "
+                "demoted prefix (req %s)",
+                len(suffix_vals),
+                req.rid,
             )
 
     def cache_unfinished_req(self, req: Req, chunked: bool = False, **kwargs) -> None:
@@ -1315,9 +1482,31 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         self._update_evictable_leaf_sets(node)
 
     def _remove_leaf_from_parent(self, node: UnifiedTreeNode):
+        # TODO(upstream): hardening over upstream's bare `assert v == node`,
+        # which (a) gives zero forensic context, (b) fires AFTER the pop
+        # already detached whatever occupied the slot (collateral damage
+        # when v is a different node), and (c) is stripped under `python
+        # -O`, letting tree corruption proceed silently. Restore-then-raise
+        # keeps the pre-error state intact for the dump. Candidate for an
+        # upstream diagnosability PR together with sanity_check's stale
+        # host-leaf detail dump.
         key = node.key.child_key(self.page_size)
         v = node.parent.children.pop(key, None)
-        assert v == node
+        if v is not node:
+            if v is not None:
+                node.parent.children[key] = v
+            cd = node.component_data[BASE_COMPONENT_TYPE]
+            raise RuntimeError(
+                "radix unlink mismatch: "
+                f"node={node.id} evicted={node.evicted} backuped={node.backuped} "
+                f"value={'None' if cd.value is None else len(cd.value)} "
+                f"host_value={'None' if cd.host_value is None else len(cd.host_value)} "
+                f"parent={node.parent.id} popped={getattr(v, 'id', None)} "
+                f"in_dev_leaves={node in self.evictable_device_leaves} "
+                f"in_host_leaves={node in self.evictable_host_leaves} "
+                f"child_elsewhere={any(c is node for c in node.parent.children.values())} "
+                f"parent_children={[c.id for c in node.parent.children.values()][:8]}"
+            )
 
     def _evict_component_and_detach_lru(
         self,
@@ -1499,31 +1688,130 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         All freed device tokens are accumulated into *tracker*.
         """
         assert self._is_device_leaf(node), f"node {node.id} is not a D-leaf"
+        cb = getattr(self, "_hisparse_v2_on_evict", None)
         if not node.backuped:
             if (
                 self.cache_controller is not None
                 and self.cache_controller.write_policy == "write_back"
             ):
                 written = self.write_backup(node, write_back=True)
-                if written == 0:
+                if written > 0:
+                    self.writing_check(write_back=True)
+                    if cb is not None:
+                        cb(node)
+                    self._evict_to_host(node, tracker)
                     return
-                self.writing_check(write_back=True)
-                self._evict_to_host(node, tracker)
-                return
-            else:
-                # Write-through: node has no backup, delete entirely.
-                self._record_remove_event(node, medium=StorageMedium.GPU)
-                for comp in self._components_tuple:
-                    self._evict_component_and_detach_lru(
-                        node, comp, target=EvictLayer.ALL, tracker=tracker
-                    )
-                self.evictable_device_leaves.discard(node)
-                parent = node.parent
-                self._remove_leaf_from_parent(node)
-                self._update_evictable_leaf_sets(parent)
-                self._iteratively_delete_tombstone_leaf(node, tracker)
-                return
+                if not self._wb_drop_allowed(node):
+                    return
+                if cb is not None:
+                    cb(node)
+            self._delete_unreachable_host_subtree(node, tracker)
+            # Delete the node entirely.
+            self._record_remove_event(node, medium=StorageMedium.GPU)
+            for comp in self._components_tuple:
+                self._evict_component_and_detach_lru(
+                    node, comp, target=EvictLayer.ALL, tracker=tracker
+                )
+            self.evictable_device_leaves.discard(node)
+            parent = node.parent
+            self._remove_leaf_from_parent(node)
+            self._update_evictable_leaf_sets(parent)
+            self._iteratively_delete_tombstone_leaf(node, tracker)
+            return
+        if cb is not None:
+            cb(node)
         self._evict_to_host(node, tracker)
+
+    def _wb_drop_allowed(self, node: UnifiedTreeNode) -> bool:
+        """Decide whether a failed write_back backup may fall back to
+        dropping the node's device data. False = vetoed, skip the node.
+
+        Host pool saturated (write_backup already tried evict_host
+        internally): drop the device data instead of stalling. Only
+        cached data is lost; keeping device eviction always realizable
+        is what lets the scheduler trust evictable_size() without
+        host-feasibility accounting (which starves under deep chained
+        trees).
+
+        TODO(upstream): the silent-stall it replaces is a latent
+        UPSTREAM write_back bug, not HiSparse-V2-specific — a failed
+        backup used to return without evicting while evictable_size()
+        still counted the node, so the scheduler budget was lied to and
+        allocation died with "Prefill out of memory". V2 only makes it
+        easy to hit (early unlock → large un-backuped evictable sets +
+        host saturation). The drop fallback plus
+        _delete_unreachable_host_subtree (its required companion — see
+        the orphaned-leaf-set hazard) belong upstream, where they are
+        even simpler: without V2's early unlock, evictable nodes are
+        never referenced by running requests, so no veto is needed.
+        Only the two vetoes here are V2-specific.
+
+        Veto the drop when it would NOT be cache-only: (a) the node
+        backs an active V2 request's prefix (a copy-less drop masks its
+        live attention positions), or (b) a descendant holds a host
+        lock (its host slots are referenced by a live request's
+        host_locs). Both are rare once V2 admission is host-capacity
+        gated; the node is skipped and the eviction pass moves on.
+        """
+        # Fold this drop decision into the rolling cross-rank signature
+        # (checked in writing_check): node id + token count, order-sensitive.
+        self._wb_fallback_sig = (
+            self._wb_fallback_sig * 1000003
+            + node.id * 31
+            + len(node.component_data[BASE_COMPONENT_TYPE].value)
+        ) % (1 << 31)
+        guard = getattr(self, "_hisparse_v2_node_active", None)
+        if guard is not None and guard(node):
+            logger.warning(
+                "wb-drop vetoed: node %d (%d tokens) backs an "
+                "active HiSparse V2 request; skipped",
+                node.id,
+                len(node.component_data[BASE_COMPONENT_TYPE].value),
+            )
+            return False
+        stack = list(node.children.values())
+        while stack:
+            d = stack.pop()
+            if any(cd.host_lock_ref > 0 for cd in d.component_data):
+                logger.warning(
+                    "wb-drop vetoed: node %d has host-locked "
+                    "descendant %d; skipped",
+                    node.id,
+                    d.id,
+                )
+                return False
+            stack.extend(d.children.values())
+        logger.info(
+            "wb-drop: node=%d tokens=%d children=%d host_avail=%d",
+            node.id,
+            len(node.component_data[BASE_COMPONENT_TYPE].value),
+            len(node.children),
+            self.cache_controller.mem_pool_host.available_size(),
+        )
+        return True
+
+    def _delete_unreachable_host_subtree(
+        self, node: UnifiedTreeNode, tracker: dict[ComponentType, int]
+    ) -> None:
+        """Un-backuped node with host-only descendants: their prefix
+        chain breaks once this node's data is gone, so the whole
+        subtree is unreachable garbage. Delete it, freeing its host
+        slots — which directly relieves the saturation that forced the
+        wb-drop."""
+        if not node.children:
+            return
+        stack = list(node.children.values())
+        while stack:
+            d = stack.pop()
+            stack.extend(d.children.values())
+            self._record_remove_event(d, medium=StorageMedium.CPU)
+            for comp in self._components_tuple:
+                self._evict_component_and_detach_lru(
+                    d, comp, target=EvictLayer.ALL, tracker=tracker
+                )
+            self.evictable_device_leaves.discard(d)
+            self.evictable_host_leaves.discard(d)
+        node.children.clear()
 
     def _evict_host_leaf(
         self, node: UnifiedTreeNode, tracker: dict[ComponentType, int]
@@ -2510,9 +2798,40 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                     break
                 finish_count += 1
 
-        finish_count_tensor = torch.tensor(finish_count, dtype=torch.int, device="cpu")
-        self._all_reduce(finish_count_tensor, torch.distributed.ReduceOp.MIN)
-        finish_count = finish_count_tensor.item()
+        # Piggyback a divergence probe on the existing collective:
+        # write_backup outcomes should be SPMD-deterministic (host pool
+        # state only mutates on symmetric paths), so the order-sensitive
+        # signature of fallback events must be identical on all ranks.
+        # min != max ⇒ the radix trees have forked — fail loud before
+        # the desync surfaces as an undebuggable collective hang. This
+        # is DETECTION (bounded by one scheduling interval), not
+        # prevention: original HiCache relies on the same symmetry
+        # invariant with no detection at all, and synchronizing every
+        # write decision would add collectives to the eviction path
+        # (the proven deadlock source). Zero extra collectives (same
+        # tensor, 3 elements instead of 1).
+        #
+        # TODO(upstream): upstream's MIN-reduce here only absorbs ack
+        # completion-TIMING divergence and silently assumes write
+        # DECISION content is rank-identical; a real fork manifests as
+        # an undebuggable collective hang. This probe is the first
+        # continuous check of that invariant — upstream-worthy as a
+        # hardening PR independent of HiSparse.
+        probe = torch.tensor(
+            [finish_count, self._wb_fallback_sig, -self._wb_fallback_sig],
+            dtype=torch.int64,
+            device="cpu",
+        )
+        self._all_reduce(probe, torch.distributed.ReduceOp.MIN)
+        finish_count = int(probe[0].item())
+        if self.pp_rank == 0:
+            lo, hi = int(probe[1].item()), -int(probe[2].item())
+            if lo != hi:
+                raise RuntimeError(
+                    f"write-back fallback divergence across TP ranks: "
+                    f"local_sig={self._wb_fallback_sig} min={lo} max={hi}; "
+                    f"radix trees have forked — aborting."
+                )
 
         # Process completed acks
         while finish_count > 0:
@@ -2617,6 +2936,11 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         self._drain_async_work()
         self.writing_check()
         self.loading_check()
+        if self._sanity_interval > 0:
+            self._sanity_counter += 1
+            if self._sanity_counter >= self._sanity_interval:
+                self._sanity_counter = 0
+                self.sanity_check()
         if self.enable_storage:
             self.drain_storage_control_queues()
         if self.enable_storage_metrics and self.storage_metrics_collector is not None:
@@ -2935,9 +3259,20 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             )
         stale = self.evictable_host_leaves - all_node_set
         if stale:
-            E(
-                f"{len(stale)} stale nodes in host_leaves: {[n.id for n in list(stale)[:5]]}"
-            )
+            details = []
+            for n in list(stale)[:5]:
+                cd = n.component_data[BASE_COMPONENT_TYPE]
+                details.append(
+                    f"id={n.id} evicted={n.evicted} backuped={n.backuped} "
+                    f"v={'N' if cd.value is None else len(cd.value)} "
+                    f"hv={'N' if cd.host_value is None else len(cd.host_value)} "
+                    f"lock={cd.lock_ref} hlock={cd.host_lock_ref} "
+                    f"parent={n.parent.id if n.parent else None} "
+                    f"parent_in_tree={n.parent in all_node_set} "
+                    f"children={len(n.children)} "
+                    f"wt_pending={n.write_through_pending_id}"
+                )
+            E(f"{len(stale)} stale nodes in host_leaves: {details}")
 
         # Per-component LRU tracking
         for ct in self.tree_components:
