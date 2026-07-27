@@ -1105,9 +1105,22 @@ class KVCacheConfigurator:
             PoolCls = HiSparseDSATokenToKVPool
             from sglang.srt.mem_cache.sparsity import parse_hisparse_config
 
-            pool_kwargs["host_to_device_ratio"] = parse_hisparse_config(
-                self.server_args
-            ).host_to_device_ratio
+            h2d = parse_hisparse_config(self.server_args).host_to_device_ratio
+            if self.is_draft_worker:
+                # The draft (NextN) KV is addressed by the target's LOGICAL ids:
+                # the draft reuses the target's allocator and req_to_token, and
+                # its indexer buffer is logical-sized as well. But its attention
+                # read path cannot translate logical -> physical (that lives in
+                # the backend, gated on a coordinator the draft never gets), so
+                # the draft must be flat: size == the whole logical space and
+                # host_to_device_ratio=1 (keeps index_buf_size logical too).
+                # Its mapping is deliberately left unset, so KV writes and reads
+                # both stay in logical space. This also makes the draft's KV
+                # immune to the target's carve/ring/LRU remapping.
+                max_total_num_tokens = max_total_num_tokens * h2d
+                pool_kwargs["host_to_device_ratio"] = 1
+            else:
+                pool_kwargs["host_to_device_ratio"] = h2d
         elif dsa_cp_layer_shard_rank is not None:
             # DSA cache layer split: shard KV/indexer layers across CP ranks.
             from sglang.srt.mem_cache.dsa_cache_layer_split import (
@@ -1658,6 +1671,54 @@ class KVCacheConfigurator:
             )
         return max_num_reqs
 
+    def _cap_max_reqs_for_hisparse(
+        self, *, max_total_num_tokens: int, max_running_requests: int
+    ) -> int:
+        """Clamp concurrency to the HiSparse fixed per-request footprint.
+
+        Every admitted MTP request reserves a padded device buffer plus a
+        staging ring that the scheduler's token-based admission does not
+        account for. Called before the pools are built, so req_to_token_pool
+        and the coordinator's per-layer metadata are sized from the final
+        concurrency instead of the requested one.
+        """
+        from sglang.srt.managers.hisparse_coordinator import (
+            hisparse_spec_ring_capacity,
+        )
+        from sglang.srt.mem_cache.sparsity import parse_hisparse_config
+
+        spec_ring_capacity = hisparse_spec_ring_capacity(self.server_args)
+        if spec_ring_capacity == 0:
+            # Plain HiSparse carves the buffer at the staging ack, so there is
+            # no fixed per-request reservation to budget for.
+            return max_running_requests
+
+        page_size = self.server_args.page_size
+        device_buffer_size = parse_hisparse_config(self.server_args).device_buffer_size
+        per_req_physical = device_buffer_size + page_size + spec_ring_capacity
+        # Page 0 of the physical pool is reserved (mapping sentinel 0).
+        max_reqs_by_pool = (max_total_num_tokens - page_size) // per_req_physical
+        if max_reqs_by_pool < 1:
+            raise ValueError(
+                "HiSparse + MTP: physical pool "
+                f"({max_total_num_tokens} tokens) cannot hold even one "
+                f"request's fixed footprint ({per_req_physical} tokens: "
+                f"buffer {device_buffer_size} + reserved page {page_size} + "
+                f"ring {spec_ring_capacity}). Increase --mem-fraction-static "
+                "or reduce device_buffer_size."
+            )
+        if max_running_requests <= max_reqs_by_pool:
+            return max_running_requests
+        logger.warning(
+            "HiSparse + MTP: capping max_running_requests %d -> %d "
+            "(hisparse pool %d tokens / %d fixed tokens per request).",
+            max_running_requests,
+            max_reqs_by_pool,
+            max_total_num_tokens,
+            per_req_physical,
+        )
+        return max_reqs_by_pool
+
     def _resolve_memory_pool_config(
         self, pre_model_load_memory: int
     ) -> MemoryPoolConfig:
@@ -1671,6 +1732,11 @@ class KVCacheConfigurator:
         config.max_running_requests = self.resolve_max_num_reqs(
             config.max_total_num_tokens
         )
+        if self.server_args.enable_hisparse and not self.is_draft_worker:
+            config.max_running_requests = self._cap_max_reqs_for_hisparse(
+                max_total_num_tokens=config.max_total_num_tokens,
+                max_running_requests=config.max_running_requests,
+            )
         configurator = create_memory_pool_configurator(self)
         config = configurator.finalize_with_max_running_requests(config)
         config.mem_fraction_static = self.server_args.mem_fraction_static

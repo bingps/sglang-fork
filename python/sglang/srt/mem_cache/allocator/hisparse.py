@@ -1,4 +1,5 @@
 import weakref
+from contextlib import contextmanager
 
 import torch
 
@@ -63,6 +64,7 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.release_pages = None
         self.is_not_in_free_group = True
         self.free_group = []
+        self._spec_logical = False
         self.clear()
         self._kvcache.register_mapping(
             weakref.proxy(self.full_to_hisparse_device_index_mapping)
@@ -85,7 +87,24 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def get_kvcache(self):
         return self._kvcache
 
+    @contextmanager
+    def spec_logical_alloc(self):
+        """Scope in which alloc/alloc_extend hand out LOGICAL indices only.
+
+        MTP spec-decode slots take their physical locations from the
+        per-request staging ring, not the global hisparse pool. Entered by
+        eagle_prepare_for_decode around alloc_for_spec_decode so the shared
+        allocation helpers need no mode parameter.
+        """
+        self._spec_logical = True
+        try:
+            yield
+        finally:
+            self._spec_logical = False
+
     def alloc(self, need_size: int):
+        if self._spec_logical:
+            return self.alloc_spec_logical(need_size)
         if self.page_size != 1:
             raise NotImplementedError(
                 "HiSparse generic allocation is only supported for page_size=1. "
@@ -116,7 +135,9 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         """Allocate only logical indices without hisparse device indices.
 
         Used in the direct-to-host transfer path where KV data is written
-        directly to host memory by the prefill node, skipping GPU staging.
+        directly to host memory by the prefill node, skipping GPU staging,
+        and in the MTP speculative path where physical slots come from the
+        per-request staging ring.
         """
         return self.logical_attn_allocator.alloc_extend(
             prefix_lens,
@@ -126,6 +147,16 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             last_loc,
             extend_num_tokens,
         )
+
+    def alloc_spec_logical(self, need_size: int):
+        """page_size==1 variant of alloc_logical_only (see alloc_token_slots)."""
+        # alloc() floors to whole pages, so a page_size > 1 caller would get
+        # fewer slots than requested. page_size > 1 is routed to alloc_extend.
+        assert self.page_size == 1, (
+            f"alloc_spec_logical requires page_size == 1, got {self.page_size}; "
+            "page_size > 1 must go through alloc_extend."
+        )
+        return self.logical_attn_allocator.alloc(need_size)
 
     def alloc_device_buffer(self, allocated_indices, need_size: int):
         assert need_size % self.page_size == 0
@@ -165,6 +196,89 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             buffer_indices = torch.cat([hisparse_indices, extra_indices])
         return buffer_indices
 
+    def alloc_device_buffer_mtp(
+        self, allocated_indices, need_size: int, defer_free: bool = False
+    ):
+        """Carve the device buffer for MTP, returning the retained logical ids.
+
+        Differences from ``alloc_device_buffer`` (the plain-decode version),
+        all required by the MTP verify swap-in:
+        - returns ``buffer_alloc``: the LOGICAL ids kept in the buffer, which
+          key the verify kernel's buffer-match table (fused top-k emits
+          logical ids, not request-relative positions);
+        - restores ``full_to_hisparse_device_index_mapping`` for those ids so
+          verify's first-level ``direct_loc`` lookup resolves them;
+        - frees surplus at PAGE granularity, excluding pages shared with the
+          buffer: the full padded buffer makes the boundary arbitrary, so
+          token-granular frees would return an in-use page to the free list;
+        - with ``defer_free``, returns the surplus pages instead of releasing
+          them (the staging DMA may still be reading those source pages);
+        - restores the mapping on allocation failure so the caller can reclaim
+          deferred pages and retry.
+
+        Returns ``(buffer_indices, buffer_alloc)``, plus
+        ``deferred_free_indices`` when ``defer_free`` is set.
+        """
+        assert need_size % self.page_size == 0
+        hisparse_indices = self.full_to_hisparse_device_index_mapping[allocated_indices]
+        self.full_to_hisparse_device_index_mapping[allocated_indices] = 0
+        valid_mask = hisparse_indices > 0
+        valid_hisparse = hisparse_indices[valid_mask]
+        valid_alloc = allocated_indices[valid_mask]
+        deferred_free_indices = torch.empty(
+            (0,), dtype=valid_hisparse.dtype, device=valid_hisparse.device
+        )
+        if len(valid_hisparse) >= need_size:
+            buffer_indices = valid_hisparse[:need_size]
+            buffer_alloc = valid_alloc[:need_size]
+            surplus = valid_hisparse[need_size:]
+            if surplus.numel() > 0:
+                buffer_pages = torch.unique(buffer_indices // self.page_size)
+                surplus_pages = torch.unique(surplus // self.page_size)
+                deferred_pages = surplus_pages[
+                    ~torch.isin(surplus_pages, buffer_pages)
+                ]
+                deferred_free_indices = deferred_pages * self.page_size
+                if not defer_free:
+                    self.free_hisparse_indices(deferred_free_indices)
+        else:
+            buffer_alloc = valid_alloc
+            page_residual_length = len(valid_hisparse) % self.page_size
+            if page_residual_length != 0:
+                valid_hisparse = torch.cat(
+                    [
+                        valid_hisparse,
+                        torch.arange(
+                            valid_hisparse[-1] + 1,
+                            valid_hisparse[-1]
+                            + self.page_size
+                            - page_residual_length
+                            + 1,
+                            device=self.device,
+                        ),
+                    ]
+                )
+            extra_indices = self.hisparse_attn_allocator.alloc(
+                need_size - len(valid_hisparse)
+            )
+            if extra_indices is None:
+                # Clearing the mapping is part of committing the buffer
+                # transition. Restore it when the extra allocation cannot be
+                # satisfied so the caller can safely release or retry the req.
+                self.full_to_hisparse_device_index_mapping[allocated_indices] = (
+                    hisparse_indices
+                )
+                raise RuntimeError("Hisparse allocation failed in alloc_device_buffer")
+            buffer_indices = torch.cat([valid_hisparse, extra_indices])
+
+        n = min(len(buffer_alloc), len(buffer_indices))
+        self.full_to_hisparse_device_index_mapping[buffer_alloc[:n]] = buffer_indices[
+            :n
+        ]
+        if defer_free:
+            return buffer_indices, buffer_alloc, deferred_free_indices
+        return buffer_indices, buffer_alloc
+
     def free_hisparse_indices(self, buffer_indices: torch.Tensor):
         # disable free group mechanism for device buffer free
         self.hisparse_attn_allocator.is_not_in_free_group = True
@@ -185,6 +299,15 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         last_loc: torch.Tensor,  # last_loc for full layers
         extend_num_tokens: int,
     ):
+        if self._spec_logical:
+            return self.alloc_logical_only(
+                prefix_lens,
+                prefix_lens_cpu,
+                seq_lens,
+                seq_lens_cpu,
+                last_loc,
+                extend_num_tokens,
+            )
         num_new_pages = get_num_new_pages(
             seq_lens=seq_lens_cpu, page_size=self.page_size, prefix_lens=prefix_lens_cpu
         )
@@ -199,6 +322,23 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         ):
             return None
 
+        hisparse_last_loc = self.get_last_loc_hisparse_device(last_loc)
+        # Fail fast if a row's physical tail mapping was cleared while the row
+        # is still extending: the paged allocator would emit the partial-page
+        # tokens at slot 0+1 — a physical slot this request does not own. The
+        # last-chunk admission gate guarantees this cannot happen (staging /
+        # ring recycling only run after prefill completes). Checked BEFORE the
+        # logical allocation so that tripping it does not leak logical pages.
+        # The GPU-sync any() is gated behind the free CPU-side prefix check:
+        # with the radix cache disabled (required by hisparse) almost every
+        # prefill row has prefix 0 and skips it.
+        if bool((prefix_lens_cpu > 0).any()):
+            assert not bool((hisparse_last_loc == 0).any()), (
+                "HiSparse alloc_extend: a row's tail mapping is cleared while "
+                "it is still extending; admission must wait for the last "
+                "prefill chunk."
+            )
+
         logical_indices = self.logical_attn_allocator.alloc_extend(
             prefix_lens,
             prefix_lens_cpu,
@@ -209,7 +349,6 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         )
         assert logical_indices is not None, "Logical allocation failed in alloc_extend"
 
-        hisparse_last_loc = self.get_last_loc_hisparse_device(last_loc)
         hisparse_indices = self.hisparse_attn_allocator.alloc_extend(
             prefix_lens,
             prefix_lens_cpu,
@@ -266,11 +405,9 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         assert (
             self.logical_attn_allocator.available_size()
             <= self.logical_attn_allocator.size
-        )
-        assert (
-            self.hisparse_attn_allocator.available_size()
-            <= self.hisparse_attn_allocator.size
-        )
+        ), f"logical: avail={self.logical_attn_allocator.available_size()} > size={self.logical_attn_allocator.size}"
+        ha, hs = self.hisparse_attn_allocator.available_size(), self.hisparse_attn_allocator.size
+        assert ha <= hs, f"hisparse: avail={ha} > size={hs}, freed={free_index.numel()}"
 
 
 class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):

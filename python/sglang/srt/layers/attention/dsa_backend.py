@@ -1884,6 +1884,10 @@ class DeepseekSparseAttnBackend(
             )
             else self.dsa_prefill_impl
         )
+        hisparse_verify = (
+            forward_batch.hisparse_coordinator is not None
+            and forward_batch.forward_mode.is_target_verify()
+        )
 
         if dsa_impl == "trtllm" and not self.use_mha:
             return self._forward_trtllm(
@@ -1988,12 +1992,28 @@ class DeepseekSparseAttnBackend(
                     cu_seqlens_q=metadata.cu_seqlens_q,
                 )
 
-        # todo hisparse: to cover more backends
+        # Prefill/extend batches don't attach a coordinator to forward_batch,
+        # but their page tables still hold logical ids that must be translated
+        # to hisparse device locations. Gate on the backend's coordinator; the
+        # verify swap-in additionally needs the batch-attached one.
         if self.hisparse_coordinator is not None:
-            # flash_mla_sparse_fwd / tilelang require int32 page indices.
-            page_table_1 = self.token_to_kv_pool.translate_loc_to_hisparse_device(
-                page_table_1
-            ).to(torch.int32)
+            if hisparse_verify:
+                bs = forward_batch.batch_size
+                total_tokens = page_table_1.shape[0]
+                N = total_tokens // bs
+                page_table_1 = self.hisparse_coordinator.swap_in_verify_pages(
+                    req_pool_indices=forward_batch.req_pool_indices,
+                    seq_lens=forward_batch.seq_lens,
+                    logical_top_k=page_table_1,
+                    layer_id=layer.layer_id,
+                    num_positions=N,
+                )
+            else:
+                page_table_1 = (
+                    self.token_to_kv_pool.translate_loc_to_hisparse_device(
+                        page_table_1
+                    ).to(torch.int32)
+                )
 
         if dsa_impl == "tilelang":
             if q_rope is not None:

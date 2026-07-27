@@ -465,6 +465,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     sampling_info: SamplingBatchInfo = None
     # Speculative decoding
     spec_info: Optional[SpecInput] = None
+    # HiSparse coordinator for swap-in attention (set for verify/decode)
+    hisparse_coordinator: object = None
 
     # === Derived from ScheduleBatch.reqs ===
     # For LoRA

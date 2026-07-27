@@ -11,6 +11,7 @@ import os
 import unittest
 from array import array
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
@@ -54,6 +55,8 @@ def _make_req(rid="test-req-0", origin_input_ids=None, output_ids=None):
         kv_committed_len=0,
         finished_reason=None,
         hisparse_staging=False,
+        hisparse_last_backed_len=None,
+        hisparse_ring_start=None,
         staging=False,
         inflight_middle_chunks=0,
     )
@@ -140,10 +143,13 @@ class TestHiSparseUnit(unittest.TestCase):
             enable_memory_saver=False,
         )
 
-        from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
+        from sglang.srt.managers.hisparse_coordinator import (
+            HiSparseCoordinator,
+            HiSparseMTPCoordinator,
+        )
 
         cls.page_size = global_page_size
-        cls.coordinator = HiSparseCoordinator(
+        cls.non_mtp_coordinator = HiSparseCoordinator(
             req_to_token_pool=cls.req_to_token_pool,
             token_to_kv_pool_allocator=cls.allocator,
             top_k=TOP_K,
@@ -151,6 +157,16 @@ class TestHiSparseUnit(unittest.TestCase):
             device="cuda",
             tp_group=cls.tp_group,
             host_to_device_ratio=HOST_TO_DEVICE_RATIO,
+        )
+        cls.mtp_coordinator = HiSparseMTPCoordinator(
+            req_to_token_pool=cls.req_to_token_pool,
+            token_to_kv_pool_allocator=cls.allocator,
+            top_k=TOP_K,
+            device_buffer_size=DEVICE_BUFFER_SIZE,
+            device="cuda",
+            tp_group=cls.tp_group,
+            host_to_device_ratio=HOST_TO_DEVICE_RATIO,
+            spec_ring_capacity=global_page_size,
         )
 
     @classmethod
@@ -167,19 +183,53 @@ class TestHiSparseUnit(unittest.TestCase):
         Without this, a mid-test assertion failure skips cleanup and leaks
         resources, causing unrelated failures in later tests.
         """
+        mtp_tests = {
+            "test_mtp_long_staging_swaps_buffer_and_host_logical_tokens",
+            "test_mtp_accepted_kv_survives_backup_and_direct_page_release",
+            "test_mtp_direct_path_uses_logical_identities",
+            "test_mtp_position_swap_in_raises",
+            "test_spec_ring_pool_stable_across_rounds",
+            "test_spec_ring_wrap_recycles_mapping",
+            "test_spec_mode_allocates_full_device_buffer",
+            "test_admit_long_prompt_reclaims_deferred_pages_for_ring",
+            # Eager admission-time alloc (deferred surplus pages) is MTP-only.
+            "test_staging_defers_surplus_pages_until_backup_finishes",
+            "test_staging_action_survives_eager_allocation_failure",
+        }
+        self.coordinator = (
+            self.mtp_coordinator
+            if self._testMethodName in mtp_tests
+            else self.non_mtp_coordinator
+        )
+
         self.allocator.clear()
         self.req_to_token_pool.clear()
-        self.coordinator.mem_pool_host.clear()
+        self.non_mtp_coordinator.mem_pool_host.clear()
+        self.mtp_coordinator.mem_pool_host.clear()
         # Reset per-request coordinator bookkeeping
         self.coordinator.req_to_device_buffer.zero_()
         self.coordinator.req_device_buffer_size.zero_()
         self.coordinator.req_to_host_pool.fill_(-1)
         self.coordinator.req_to_host_pool_allocated_len.zero_()
-        self.coordinator.req_device_buffer_tokens.fill_(-1)
+        if self.coordinator.req_device_buffer_tokens is not None:
+            self.coordinator.req_device_buffer_tokens.fill_(-1)
         self.coordinator.req_device_buffer_token_locs.fill_(-1)
+        if self.coordinator.req_device_buffer_logical_locs is not None:
+            self.coordinator.req_device_buffer_logical_locs.fill_(-1)
+        if self.coordinator.full_to_token_position is not None:
+            self.coordinator.full_to_token_position.fill_(-1)
+        self.coordinator.num_real_reqs.zero_()
         self.coordinator.lru_slots[:] = self.coordinator._lru_init.view(1, 1, -1)
         self.coordinator.ack_staging_queue.clear()
         self.coordinator._has_pending_backup = False
+        if self.coordinator is self.mtp_coordinator:
+            self.coordinator.spec_ring_capacity = self.page_size
+            self.coordinator.req_to_spec_ring = torch.zeros(
+                (MAX_NUM_REQS, self.page_size),
+                dtype=torch.int64,
+                device="cuda",
+            )
+            self.coordinator.req_spec_ring_active = [False] * MAX_NUM_REQS
         for i in range(len(self.coordinator._skip_first_backup)):
             self.coordinator._skip_first_backup[i] = False
 
@@ -348,6 +398,41 @@ class TestHiSparseUnit(unittest.TestCase):
         self.coordinator.num_real_reqs[0] = rpi.shape[0]
         return self.coordinator.swap_in_selected_pages(rpi, sls, batch, layer_id)
 
+    def _swap_in_selected_logical_pages(
+        self,
+        rpi: torch.Tensor,
+        sls: torch.Tensor,
+        batch: torch.Tensor,
+        layer_id: int,
+    ) -> torch.Tensor:
+        # Exercise the production verify path with a single position per req.
+        self.coordinator.num_real_reqs[0] = rpi.shape[0]
+        return self.coordinator.swap_in_verify_pages(
+            req_pool_indices=rpi,
+            seq_lens=sls,
+            logical_top_k=batch,
+            layer_id=layer_id,
+            num_positions=1,
+        )
+
+    def _clear_mapping(self, logical_locs):
+        """Test-side replacement for the removed release_backed_logical_locs:
+        clear the global mapping for backed/recycled tokens (production does
+        this inside assign_spec_ring_slots_batch / request_finished)."""
+        compressed = self.coordinator.mem_pool_device.translate_loc_from_full_to_compressed(
+            logical_locs
+        )
+        self.allocator.full_to_hisparse_device_index_mapping[compressed] = 0
+
+    def _collect_ready_reqs_blocking(self):
+        """Wait for in-flight staging DMA, then collect ready requests.
+
+        Test-side replacement for the removed coordinator helper: production
+        polls collect_ready_reqs non-blockingly per scheduler iteration."""
+        for act in self.coordinator.ack_staging_queue:
+            act.finish_event.synchronize()
+        return self.coordinator.collect_ready_reqs()
+
     def _cleanup_req(self, req, kv_loc, *, logical_only=False):
         """request_finished -> free KV -> free req slot."""
         self.coordinator.request_finished(req)
@@ -375,6 +460,101 @@ class TestHiSparseUnit(unittest.TestCase):
     # ==================================================================
     # Test: Kernel correctness — short sequence (fast path)
     # ==================================================================
+    def test_buffer_identity_tables_are_mode_specific(self):
+        self.assertFalse(self.non_mtp_coordinator.mtp_enabled)
+        self.assertIsNotNone(self.non_mtp_coordinator.req_device_buffer_tokens)
+        self.assertIsNone(
+            self.non_mtp_coordinator.req_device_buffer_logical_locs
+        )
+        self.assertTrue(self.mtp_coordinator.mtp_enabled)
+        self.assertIsNone(self.mtp_coordinator.req_device_buffer_tokens)
+        self.assertIsNotNone(
+            self.mtp_coordinator.req_device_buffer_logical_locs
+        )
+
+    def test_spec_logical_alloc_context(self):
+        """Inside spec_logical_alloc, alloc/alloc_extend hand out logical
+        slots only: the physical pool and the mapping stay untouched."""
+        a = self.allocator
+        device = a.device
+        n = self.page_size
+        physical_before = a.hisparse_attn_allocator.available_size()
+
+        with a.spec_logical_alloc():
+            kv_loc = a.alloc_extend(
+                prefix_lens=torch.tensor([0], dtype=torch.int64, device=device),
+                prefix_lens_cpu=torch.tensor([0], dtype=torch.int64),
+                seq_lens=torch.tensor([n], dtype=torch.int64, device=device),
+                seq_lens_cpu=torch.tensor([n], dtype=torch.int64),
+                last_loc=torch.tensor([-1], dtype=torch.int64, device=device),
+                extend_num_tokens=n,
+            )
+        self.assertIsNotNone(kv_loc)
+        self.assertEqual(
+            a.hisparse_attn_allocator.available_size(), physical_before
+        )
+        self.assertTrue(
+            torch.all(a.full_to_hisparse_device_index_mapping[kv_loc] == 0)
+        )
+        self.assertFalse(a._spec_logical)
+        a.logical_attn_allocator.free(kv_loc)
+
+    def test_mtp_position_swap_in_raises(self):
+        """The position-keyed decode swap-in is unreachable in MTP mode
+        (decode runs through swap_in_verify_pages; IDLE early-returns in
+        the attention dispatch) — the override must fail fast."""
+        req_pool_indices = torch.zeros(1, dtype=torch.int64, device="cuda")
+        seq_lens = torch.zeros(1, dtype=torch.int32, device="cuda")
+        top_k = torch.zeros((1, TOP_K), dtype=torch.int32, device="cuda")
+
+        with self.assertRaisesRegex(RuntimeError, "MTP mode"):
+            self.coordinator.swap_in_selected_pages(
+                req_pool_indices,
+                seq_lens,
+                top_k,
+                layer_id=0,
+            )
+
+    def test_mtp_direct_path_uses_logical_identities(self):
+        initial = self._get_initial_sizes()
+        fill_len = self.page_size
+        req = _make_req("mtp-direct", list(range(fill_len)))
+        self._alloc_req_slot(req)
+
+        kv_loc = self._alloc_kv(req, fill_len, logical_only=True)
+        self._populate_host_pool(req, fill_len)
+        self.coordinator.admit_request_direct(req)
+
+        identities = self.coordinator.req_device_buffer_logical_locs[
+            0, req.req_pool_idx, :fill_len
+        ].to(torch.int64)
+        self.assertTrue(torch.equal(identities, kv_loc))
+
+        logical_top_k = kv_loc[:TOP_K].to(torch.int32)
+        if fill_len < TOP_K:
+            logical_top_k = torch.cat(
+                [
+                    logical_top_k,
+                    torch.full(
+                        (TOP_K - fill_len,),
+                        -1,
+                        dtype=torch.int32,
+                        device="cuda",
+                    ),
+                ]
+            )
+        rpi, sls = self._make_batch_tensors([req], [fill_len])
+        locs = self._swap_in_selected_logical_pages(
+            rpi,
+            sls,
+            logical_top_k.unsqueeze(0),
+            layer_id=0,
+        )
+        self.assertTrue(torch.all(locs[0, :fill_len] >= 0))
+
+        self._cleanup_req(req, kv_loc, logical_only=True)
+        self._assert_sizes_restored(initial, "mtp_direct")
+
     def test_kernel_correctness_short_seq(self):
         """Short seq (len <= device_buffer_size): kernel fast path returns
         device buffer locs, matching naive_load_topk."""
@@ -524,14 +704,184 @@ class TestHiSparseUnit(unittest.TestCase):
             ((fill_len + self.page_size - 1) // self.page_size) * self.page_size,
             DEVICE_BUFFER_SIZE,
         )
-        buf_idx = self.allocator.alloc_device_buffer(kv_loc, need_size)
+        buf_idx, buf_alloc = self.allocator.alloc_device_buffer_mtp(kv_loc, need_size)
         self.assertIsNotNone(buf_idx)
-        mapping_after = self.allocator.full_to_hisparse_device_index_mapping[kv_loc]
-        self.assertTrue(torch.all(mapping_after == 0), "Mapping should be cleared")
+        # MTP variant: buffer-retained tokens keep valid mapping for
+        # direct_loc; surplus tokens have mapping cleared to 0.
+        buffer_retained = kv_loc[:need_size]
+        surplus = kv_loc[need_size:]
+        self.assertTrue(torch.equal(buf_alloc, buffer_retained))
+        retained_mapping = self.allocator.full_to_hisparse_device_index_mapping[buffer_retained]
+        self.assertTrue(torch.all(retained_mapping > 0), "Buffer-retained mapping should be valid")
+        if len(surplus) > 0:
+            surplus_mapping = self.allocator.full_to_hisparse_device_index_mapping[surplus]
+            self.assertTrue(torch.all(surplus_mapping == 0), "Surplus mapping should be cleared")
 
         self.allocator.free_hisparse_indices(buf_idx)
         self.allocator.logical_attn_allocator.free(kv_loc)
         self._assert_sizes_restored(initial, "alloc_free_cycle")
+
+    def test_allocator_buffer_failure_restores_mapping(self):
+        """A failed buffer transition must leave the original KV releasable."""
+        initial = self._get_initial_sizes()
+        device = self.allocator.device
+        fill_len = self.page_size
+
+        kv_loc = self.allocator.alloc_extend(
+            prefix_lens=torch.tensor([0], dtype=torch.int64, device=device),
+            prefix_lens_cpu=torch.tensor([0], dtype=torch.int64),
+            seq_lens=torch.tensor([fill_len], dtype=torch.int64, device=device),
+            seq_lens_cpu=torch.tensor([fill_len], dtype=torch.int64),
+            last_loc=torch.tensor([-1], dtype=torch.int64, device=device),
+            extend_num_tokens=fill_len,
+        )
+        self.assertIsNotNone(kv_loc)
+        mapping_before = self.allocator.full_to_hisparse_device_index_mapping[
+            kv_loc
+        ].clone()
+
+        with patch.object(
+            self.allocator.hisparse_attn_allocator, "alloc", return_value=None
+        ):
+            with self.assertRaisesRegex(RuntimeError, "alloc_device_buffer"):
+                self.allocator.alloc_device_buffer_mtp(kv_loc, fill_len * 2)
+
+        mapping_after = self.allocator.full_to_hisparse_device_index_mapping[kv_loc]
+        self.assertTrue(torch.equal(mapping_after, mapping_before))
+
+        self.allocator.free(kv_loc)
+        self._assert_sizes_restored(initial, "buffer_failure_mapping")
+
+    def test_alloc_extend_cleared_tail_fails_fast(self):
+        """A row whose physical tail mapping is cleared while it still extends
+        violates the last-chunk admission invariant (staging / ring recycling
+        must only run after prefill completes). alloc_extend must fail fast
+        instead of silently emitting the partial-page tokens at slot 0+1 — a
+        physical slot the request does not own."""
+        if self.page_size == 1:
+            self.skipTest("page continuation requires page_size > 1")
+        initial = self._get_initial_sizes()
+        device = self.allocator.device
+        mapping = self.allocator.full_to_hisparse_device_index_mapping
+
+        n = self.page_size + 1  # spills one token into a second page
+        kv_loc = self.allocator.alloc_extend(
+            prefix_lens=torch.tensor([0], dtype=torch.int64, device=device),
+            prefix_lens_cpu=torch.tensor([0], dtype=torch.int64),
+            seq_lens=torch.tensor([n], dtype=torch.int64, device=device),
+            seq_lens_cpu=torch.tensor([n], dtype=torch.int64),
+            last_loc=torch.tensor([-1], dtype=torch.int64, device=device),
+            extend_num_tokens=n,
+        )
+        self.assertIsNotNone(kv_loc)
+
+        # Simulate the invariant violation: the tail token's mapping cleared
+        # while the row still extends. Keep the stale physical loc for
+        # page-granular cleanup below.
+        stale_hi = mapping[kv_loc[n - 1]].clone()
+        mapping[kv_loc[n - 1]] = 0
+
+        with self.assertRaisesRegex(AssertionError, "tail mapping"):
+            self.allocator.alloc_extend(
+                prefix_lens=torch.tensor([n], dtype=torch.int64, device=device),
+                prefix_lens_cpu=torch.tensor([n], dtype=torch.int64),
+                seq_lens=torch.tensor([n + 1], dtype=torch.int64, device=device),
+                seq_lens_cpu=torch.tensor([n + 1], dtype=torch.int64),
+                last_loc=kv_loc[n - 1 : n],
+                extend_num_tokens=1,
+            )
+
+        # Cleanup: free all physical pages of the row (including the stale
+        # one) and the logical pages (which also cover the slot claimed by
+        # the failed call before its assert).
+        hi_all = mapping[kv_loc]
+        hi_all = torch.cat([hi_all[hi_all > 0], stale_hi.view(1)])
+        pages = torch.unique(hi_all // self.page_size)
+        self.allocator.free_hisparse_indices(pages * self.page_size)
+        mapping[kv_loc] = 0
+        self.allocator.logical_attn_allocator.free(kv_loc)
+        self._assert_sizes_restored(initial, "cleared_tail_fails_fast")
+
+    def test_release_backed_partial_page_waits_for_last_logical_reference(self):
+        """Backing part of a page must not release live speculative siblings."""
+        if self.page_size == 1:
+            self.skipTest("partial-page ownership requires page_size > 1")
+
+        initial = self._get_initial_sizes()
+        fill_len = self.page_size
+        req = _make_req("release-backed-partial", list(range(fill_len)))
+        self._alloc_req_slot(req)
+        kv_loc = self._alloc_kv(req, fill_len)
+
+        split = self.page_size // 2
+        self._clear_mapping(kv_loc[:split])
+        mapping = self.allocator.full_to_hisparse_device_index_mapping[kv_loc]
+        self.assertTrue(torch.all(mapping[:split] == 0))
+        self.assertTrue(torch.all(mapping[split:] > 0))
+
+        self._clear_mapping(kv_loc[split:])
+        self.assertTrue(
+            torch.all(
+                self.allocator.full_to_hisparse_device_index_mapping[kv_loc] == 0
+            )
+        )
+        # Physical pages are NOT freed by clearing the mapping —
+        # they are reclaimed in request_finished(). Only mapping is cleared.
+
+        self.allocator.logical_attn_allocator.free(kv_loc)
+        self._free_req_slot(req)
+        # Cannot assert full size restore — hisparse pages only freed
+        # via request_finished(), not release_backed.
+
+    def test_release_backed_frees_fully_unreferenced_pages(self):
+        """Mapping is cleared; physical pages reclaimed by request_finished."""
+        initial = self._get_initial_sizes()
+        fill_len = self.page_size * 2
+        req = _make_req("release-backed-full", list(range(fill_len)))
+        self._alloc_req_slot(req)
+        kv_loc = self._alloc_kv(req, fill_len)
+
+        self._clear_mapping(kv_loc)
+
+        self.assertTrue(
+            torch.all(
+                self.allocator.full_to_hisparse_device_index_mapping[kv_loc] == 0
+            )
+        )
+        # Physical pages are NOT freed by clearing the mapping —
+        # they are reclaimed in request_finished().
+
+        self.allocator.logical_attn_allocator.free(kv_loc)
+        self._free_req_slot(req)
+        # Cannot assert full size restore here since hisparse pages
+        # are only freed via request_finished(), not release_backed.
+
+    def test_release_backed_preserves_device_buffer_pages(self):
+        """A cleared global mapping must not free a buffer-owned physical page."""
+        initial = self._get_initial_sizes()
+        fill_len = self.page_size
+        req = _make_req("release-backed-buffer", list(range(fill_len)))
+        self._alloc_req_slot(req)
+        kv_loc = self._alloc_kv(req, fill_len)
+        self.coordinator.alloc_device_buffer(req)
+
+        buffer_loc = self.coordinator.req_to_device_buffer[req.req_pool_idx, 0]
+        self.allocator.full_to_hisparse_device_index_mapping[kv_loc[0]] = buffer_loc
+        before_release = self.allocator.hisparse_attn_allocator.available_size()
+
+        self._clear_mapping(kv_loc[:1])
+
+        self.assertEqual(
+            int(self.allocator.full_to_hisparse_device_index_mapping[kv_loc[0]]), 0
+        )
+        self.assertEqual(
+            self.allocator.hisparse_attn_allocator.available_size(), before_release
+        )
+
+        self.coordinator.request_finished(req)
+        self.allocator.logical_attn_allocator.free(kv_loc)
+        self._free_req_slot(req)
+        self._assert_sizes_restored(initial, "release_backed_buffer")
 
     def test_allocator_page_size_one_alloc_free_cycle(self):
         """alloc() maps logical to hisparse indices for ROCm page_size=1."""
@@ -622,12 +972,39 @@ class TestHiSparseUnit(unittest.TestCase):
 
         self.coordinator.admit_request_into_staging(req)
         self.assertTrue(req.hisparse_staging)
+        # The logical-id -> position inverse map is MTP-only; the plain
+        # coordinator does not allocate it.
+        self.assertIsNone(self.coordinator.full_to_token_position)
+        # Plain-mode admission is DMA-only (upstream semantics): the buffer is
+        # carved at staging ack, so the mapping is still fully valid here.
+        mapping_after = self.allocator.full_to_hisparse_device_index_mapping[kv_loc]
+        self.assertTrue(
+            torch.all(mapping_after > 0),
+            "Mapping must stay untouched until collect_ready_reqs",
+        )
 
         torch.cuda.synchronize()
         ready = self.coordinator.collect_ready_reqs()
         self.assertEqual(len(ready), 1)
         self.assertFalse(req.hisparse_staging)
         self.assertTrue(self.coordinator._skip_first_backup[req.req_pool_idx])
+        # Upstream ack-time alloc isolates the buffer from outside addressing:
+        # the whole request's mapping is cleared (the decode swap-in kernel
+        # consumes only top_k_device_locs, never the mapping).
+        mapping_after = self.allocator.full_to_hisparse_device_index_mapping[kv_loc]
+        self.assertTrue(
+            torch.all(mapping_after == 0),
+            "Mapping should be cleared after the buffer carve",
+        )
+        for lid in range(LAYER_NUM):
+            self.assertTrue(
+                torch.equal(
+                    self.coordinator.req_device_buffer_tokens[
+                        lid, req.req_pool_idx, :fill_len
+                    ],
+                    torch.arange(fill_len, dtype=torch.int32, device="cuda"),
+                )
+            )
 
         tokens = self._build_topk_tokens(fill_len)
         batch = tokens.unsqueeze(0)
@@ -643,6 +1020,265 @@ class TestHiSparseUnit(unittest.TestCase):
 
         self._cleanup_req(req, kv_loc)
         self._assert_sizes_restored(initial, "staging_path")
+
+    def test_mtp_long_staging_swaps_buffer_and_host_logical_tokens(self):
+        """Fused logical top-k remains correct beyond the device buffer."""
+        initial = self._get_initial_sizes()
+        fill_len = DEVICE_BUFFER_SIZE + self.page_size * 2
+        req = _make_req("mtp-long-staging", list(range(fill_len)))
+        self._alloc_req_slot(req)
+
+        kv_loc = self._alloc_kv(req, fill_len)
+        self._write_device_patterns(kv_loc, fill_len)
+        self.coordinator.admit_request_into_staging(req)
+        self._collect_ready_reqs_blocking()
+
+        required_positions = torch.tensor(
+            [0, DEVICE_BUFFER_SIZE - 1, DEVICE_BUFFER_SIZE, fill_len - 1],
+            dtype=torch.int64,
+            device="cuda",
+        )
+        candidate_positions = torch.arange(fill_len, device="cuda")
+        candidate_positions = candidate_positions[
+            ~torch.isin(candidate_positions, required_positions)
+        ]
+        positions = torch.cat(
+            [
+                required_positions,
+                candidate_positions[
+                    torch.randperm(candidate_positions.numel(), device="cuda")[
+                        : TOP_K - required_positions.numel()
+                    ]
+                ],
+            ]
+        )
+        logical_top_k = kv_loc[positions].to(torch.int32).unsqueeze(0)
+        rpi, sls = self._make_batch_tensors([req], [fill_len])
+
+        for layer_id in range(LAYER_NUM):
+            locs = self._swap_in_selected_logical_pages(
+                rpi, sls, logical_top_k, layer_id
+            )
+            self.assertTrue(torch.all(locs >= 0))
+            for i, position in enumerate(positions.tolist()):
+                expected = self._kv_pattern(layer_id, position)
+                actual = self.device_pool.kv_buffer[layer_id][locs[0, i].long()]
+                self.assertTrue(
+                    torch.allclose(
+                        actual.float(),
+                        torch.full_like(actual.float(), expected),
+                        atol=1e-2,
+                    ),
+                    f"layer {layer_id}, position {position}: swapped KV mismatch",
+                )
+
+        self._cleanup_req(req, kv_loc)
+        self._assert_sizes_restored(initial, "mtp_long_staging")
+
+    def test_mtp_accepted_kv_survives_backup_and_direct_page_release(self):
+        """Accepted KV is readable after its temporary physical page is freed."""
+        initial = self._get_initial_sizes()
+        fill_len = DEVICE_BUFFER_SIZE + self.page_size
+        accepted_count = self.page_size
+        req = _make_req("mtp-accepted-backup", list(range(fill_len)))
+        self._alloc_req_slot(req)
+
+        kv_loc = self._alloc_kv(req, fill_len)
+        self._write_device_patterns(kv_loc, fill_len)
+        self.coordinator.admit_request_into_staging(req)
+        self._collect_ready_reqs_blocking()
+
+        accepted_locs = self.allocator.alloc_extend(
+            prefix_lens=torch.tensor([fill_len], dtype=torch.int64, device="cuda"),
+            prefix_lens_cpu=torch.tensor([fill_len], dtype=torch.int64),
+            seq_lens=torch.tensor(
+                [fill_len + accepted_count], dtype=torch.int64, device="cuda"
+            ),
+            seq_lens_cpu=torch.tensor(
+                [fill_len + accepted_count], dtype=torch.int64
+            ),
+            last_loc=kv_loc[-1:].to(torch.int64),
+            extend_num_tokens=accepted_count,
+        )
+        self.assertIsNotNone(accepted_locs)
+        self.req_to_token_pool.write(
+            (req.req_pool_idx, slice(fill_len, fill_len + accepted_count)),
+            accepted_locs,
+        )
+        req.kv.kv_allocated_len = fill_len + accepted_count
+        req.kv_committed_len = fill_len + accepted_count
+        self.coordinator.register_token_positions(
+            req, fill_len, fill_len + accepted_count
+        )
+
+        accepted_device_locs = (
+            self.allocator.full_to_hisparse_device_index_mapping[accepted_locs]
+        )
+        self.assertTrue(torch.all(accepted_device_locs > 0))
+        for layer_id in range(LAYER_NUM):
+            for i, device_loc in enumerate(accepted_device_locs):
+                position = fill_len + i
+                self.device_pool.kv_buffer[layer_id][device_loc] = self._kv_pattern(
+                    layer_id, position
+                )
+
+        self.coordinator.backup_committed_tokens([req])
+        # Mapping stays valid — physical pages freed in request_finished.
+        self.assertTrue(
+            torch.all(
+                self.allocator.full_to_hisparse_device_index_mapping[accepted_locs]
+                > 0
+            )
+        )
+
+        logical_top_k = accepted_locs[:TOP_K].to(torch.int32).unsqueeze(0)
+        if accepted_count < TOP_K:
+            logical_top_k = torch.cat(
+                [
+                    logical_top_k,
+                    torch.full(
+                        (1, TOP_K - accepted_count),
+                        -1,
+                        dtype=torch.int32,
+                        device="cuda",
+                    ),
+                ],
+                dim=1,
+            )
+        rpi, sls = self._make_batch_tensors(
+            [req], [fill_len + accepted_count]
+        )
+        for layer_id in range(LAYER_NUM):
+            locs = self._swap_in_selected_logical_pages(
+                rpi, sls, logical_top_k, layer_id
+            )
+            for i in range(min(accepted_count, TOP_K)):
+                position = fill_len + i
+                expected = self._kv_pattern(layer_id, position)
+                actual = self.device_pool.kv_buffer[layer_id][locs[0, i].long()]
+                self.assertTrue(
+                    torch.allclose(
+                        actual.float(),
+                        torch.full_like(actual.float(), expected),
+                        atol=1e-2,
+                    ),
+                    f"layer {layer_id}, accepted position {position}: KV mismatch",
+                )
+
+        all_locs = torch.cat([kv_loc, accepted_locs])
+        self._cleanup_req(req, all_locs)
+        self._assert_sizes_restored(initial, "mtp_accepted_backup")
+
+    def test_staging_defers_surplus_pages_until_backup_finishes(self):
+        """Surplus prefill pages stay reserved while staging may still read them."""
+        initial = self._get_initial_sizes()
+        fill_len = DEVICE_BUFFER_SIZE + self.page_size * 2
+        req = _make_req("staging-deferred-free", list(range(fill_len)))
+        self._alloc_req_slot(req)
+
+        kv_loc = self._alloc_kv(req, fill_len)
+        self._write_device_patterns(kv_loc, fill_len)
+        self.coordinator.admit_request_into_staging(req)
+
+        self.assertEqual(len(self.coordinator.ack_staging_queue), 1)
+        action = self.coordinator.ack_staging_queue[0]
+        self.assertIsNotNone(action.deferred_free_indices)
+        self.assertEqual(action.deferred_free_indices.numel(), 1)
+        ring_cap = self.coordinator.spec_ring_capacity
+        self.assertEqual(
+            self.allocator.hisparse_attn_allocator.available_size(),
+            initial[1] - fill_len - ring_cap,
+        )
+
+        action.finish_event.synchronize()
+        self.assertEqual(self.coordinator.collect_ready_reqs(), [req])
+        self.assertEqual(
+            self.allocator.hisparse_attn_allocator.available_size(),
+            initial[1] - self.coordinator.padded_buffer_size - ring_cap,
+        )
+
+        self._cleanup_req(req, kv_loc)
+        self._assert_sizes_restored(initial, "staging_deferred_free")
+
+    def test_abort_staging_releases_deferred_and_buffer_pages(self):
+        initial = self._get_initial_sizes()
+        fill_len = DEVICE_BUFFER_SIZE + self.page_size * 2
+        req = _make_req("staging-abort", list(range(fill_len)))
+        self._alloc_req_slot(req)
+
+        kv_loc = self._alloc_kv(req, fill_len)
+        self._write_device_patterns(kv_loc, fill_len)
+        self.coordinator.admit_request_into_staging(req)
+        self.coordinator.abort_staging_request(req)
+
+        self.assertFalse(req.hisparse_staging)
+        self.assertEqual(self.coordinator.ack_staging_queue, [])
+        self.assertEqual(
+            int(self.coordinator.req_device_buffer_size[req.req_pool_idx]), 0
+        )
+        self.assertTrue(
+            torch.all(self.coordinator.req_to_device_buffer[req.req_pool_idx] == 0)
+        )
+        self.assertTrue(
+            torch.all(self.coordinator.req_to_host_pool[req.req_pool_idx] == -1)
+        )
+
+        self.allocator.free(kv_loc)
+        self._free_req_slot(req)
+        self._assert_sizes_restored(initial, "staging_abort")
+
+    def test_request_finished_drains_inflight_staging(self):
+        """Direct finish paths must wait for DMA and release deferred pages."""
+        initial = self._get_initial_sizes()
+        fill_len = DEVICE_BUFFER_SIZE + self.page_size * 2
+        req = _make_req("staging-direct-finish", list(range(fill_len)))
+        self._alloc_req_slot(req)
+
+        kv_loc = self._alloc_kv(req, fill_len)
+        self._write_device_patterns(kv_loc, fill_len)
+        self.coordinator.admit_request_into_staging(req)
+
+        self.coordinator.request_finished(req)
+
+        self.assertFalse(req.hisparse_staging)
+        self.assertEqual(self.coordinator.ack_staging_queue, [])
+        self.assertEqual(
+            int(self.coordinator.req_device_buffer_size[req.req_pool_idx]), 0
+        )
+        self.assertTrue(
+            torch.all(self.coordinator.req_to_host_pool[req.req_pool_idx] == -1)
+        )
+
+        self.allocator.free(kv_loc)
+        self._free_req_slot(req)
+        self._assert_sizes_restored(initial, "staging_direct_finish")
+
+    def test_staging_action_survives_eager_allocation_failure(self):
+        """A post-DMA allocation error must retain an action for safe cleanup."""
+        initial = self._get_initial_sizes()
+        fill_len = self.page_size
+        req = _make_req("staging-allocation-failure", list(range(fill_len)))
+        self._alloc_req_slot(req)
+
+        kv_loc = self._alloc_kv(req, fill_len)
+        self._write_device_patterns(kv_loc, fill_len)
+        with patch.object(
+            self.coordinator,
+            "alloc_device_buffer",
+            side_effect=RuntimeError("injected eager allocation failure"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "injected eager"):
+                self.coordinator.admit_request_into_staging(req)
+
+        self.assertTrue(req.hisparse_staging)
+        self.assertEqual(len(self.coordinator.ack_staging_queue), 1)
+        self.coordinator.request_finished(req)
+
+        self.assertFalse(req.hisparse_staging)
+        self.assertEqual(self.coordinator.ack_staging_queue, [])
+        self.allocator.free(kv_loc)
+        self._free_req_slot(req)
+        self._assert_sizes_restored(initial, "staging_allocation_failure")
 
     # ==================================================================
     # Test: Single-node staging host page allocation
@@ -847,6 +1483,201 @@ class TestHiSparseUnit(unittest.TestCase):
             self._cleanup_req(req, kv_locs[i], logical_only=is_long)
 
         self._assert_sizes_restored(initial, "batch_multiple")
+
+    # ==================================================================
+    # Test: speculative staging ring
+    # ==================================================================
+
+    def _enable_spec_ring(self, capacity):
+        """Resize the ring on the MTP coordinator for capacity-specific tests."""
+        assert capacity % self.page_size == 0
+        assert self.coordinator is self.mtp_coordinator
+        assert self.coordinator.req_device_buffer_tokens is None
+        assert self.coordinator.req_device_buffer_logical_locs is not None
+        self.coordinator.spec_ring_capacity = capacity
+        self.coordinator.req_to_spec_ring = torch.zeros(
+            (MAX_NUM_REQS, capacity), dtype=torch.int64, device="cuda"
+        )
+        self.coordinator.req_spec_ring_active = [False] * MAX_NUM_REQS
+
+    def _extend_logical(self, req, start, end):
+        """Extend [start, end) with logical-only slots and write req_to_token."""
+        device = self.allocator.device
+        rid = req.req_pool_idx
+        last_loc = (
+            self.req_to_token_pool.req_to_token[rid, start - 1 : start].to(torch.int64)
+            if start > 0
+            else torch.tensor([-1], dtype=torch.int64, device=device)
+        )
+        kv_loc = self.allocator.alloc_logical_only(
+            prefix_lens=torch.tensor([start], dtype=torch.int64, device=device),
+            prefix_lens_cpu=torch.tensor([start], dtype=torch.int64),
+            seq_lens=torch.tensor([end], dtype=torch.int64, device=device),
+            seq_lens_cpu=torch.tensor([end], dtype=torch.int64),
+            last_loc=last_loc,
+            extend_num_tokens=end - start,
+        )
+        self.assertIsNotNone(kv_loc, "logical-only alloc failed")
+        self.req_to_token_pool.write((rid, slice(start, end)), kv_loc)
+        req.kv.kv_allocated_len = end
+        return kv_loc
+
+    def test_spec_ring_pool_stable_across_rounds(self):
+        """Core regression for HiSparse+MTP memory growth: after the ring is
+        allocated, many speculative rounds must not consume any additional
+        hisparse physical pages, and request_finished must restore all pools."""
+        initial = self._get_initial_sizes()
+        R = 2 * self.page_size
+        self._enable_spec_ring(R)
+
+        fill_len = self.page_size
+        req = _make_req("spec-ring-stable", list(range(fill_len)))
+        self._alloc_req_slot(req)
+        kv_loc = self._alloc_kv(req, fill_len)
+        req.hisparse_last_backed_len = fill_len
+
+        self.coordinator._alloc_spec_ring(req)
+        self.assertTrue(self.coordinator.req_spec_ring_active[req.req_pool_idx])
+        hisparse_after_ring = self.allocator.hisparse_attn_allocator.available_size()
+
+        mapping = self.allocator.full_to_hisparse_device_index_mapping
+        ring = self.coordinator.req_to_spec_ring[req.req_pool_idx]
+        step = 8
+        pos = fill_len
+        for _ in range(12):  # 96 tokens: wraps a 128-slot ring around fill_len=64
+            nxt = pos + step
+            spec_loc = self._extend_logical(req, pos, nxt)
+            self.coordinator.assign_spec_ring_slots(req, pos, nxt)
+            # New positions map into the ring region.
+            expect = ring[
+                torch.arange(pos, nxt, dtype=torch.int64, device="cuda") % R
+            ]
+            self.assertTrue(torch.equal(mapping[spec_loc], expect))
+            # No physical pages consumed by speculative rounds.
+            self.assertEqual(
+                self.allocator.hisparse_attn_allocator.available_size(),
+                hisparse_after_ring,
+                f"hisparse pool shrank at pos {pos}",
+            )
+            # Simulate commit + backup of everything allocated so far.
+            req.kv_committed_len = nxt
+            req.hisparse_last_backed_len = nxt
+            pos = nxt
+
+        self.coordinator.request_finished(req)
+        all_locs = self.req_to_token_pool.req_to_token[req.req_pool_idx, :pos].to(
+            torch.int64
+        )
+        self.assertTrue(torch.all(mapping[all_locs] == 0))
+        self.allocator.logical_attn_allocator.free(all_locs)
+        self._free_req_slot(req)
+        self._assert_sizes_restored(initial, "spec_ring_stable")
+
+    def test_spec_ring_wrap_recycles_mapping(self):
+        """Position p and p+R share a ring slot; recycling clears p's mapping."""
+        initial = self._get_initial_sizes()
+        R = self.page_size
+        self._enable_spec_ring(R)
+
+        fill_len = self.page_size
+        req = _make_req("spec-ring-wrap", list(range(fill_len)))
+        self._alloc_req_slot(req)
+        self._alloc_kv(req, fill_len)
+        req.hisparse_last_backed_len = fill_len
+        self.coordinator._alloc_spec_ring(req)
+
+        mapping = self.allocator.full_to_hisparse_device_index_mapping
+        rid = req.req_pool_idx
+        first_loc = self._extend_logical(req, fill_len, fill_len + 4)
+        self.coordinator.assign_spec_ring_slots(req, fill_len, fill_len + 4)
+        first_mapping = mapping[first_loc].clone()
+        req.hisparse_last_backed_len = fill_len + 4
+
+        # One full ring later the same slots must be reused.
+        self._extend_logical(req, fill_len + 4, fill_len + R)
+        self.coordinator.assign_spec_ring_slots(req, fill_len + 4, fill_len + R)
+        req.hisparse_last_backed_len = fill_len + R
+        second_loc = self._extend_logical(req, fill_len + R, fill_len + R + 4)
+        self.coordinator.assign_spec_ring_slots(req, fill_len + R, fill_len + R + 4)
+
+        self.assertTrue(torch.all(mapping[first_loc] == 0), "recycled mapping kept")
+        self.assertTrue(torch.equal(mapping[second_loc], first_mapping))
+
+        # Recycling a position that is not backed up yet must fail loudly.
+        req.hisparse_last_backed_len = fill_len  # pretend backup regressed
+        self._extend_logical(req, fill_len + R + 4, fill_len + 2 * R)
+        with self.assertRaises(AssertionError):
+            self.coordinator.assign_spec_ring_slots(
+                req, fill_len + R + 4, fill_len + 2 * R
+            )
+
+        self.coordinator.request_finished(req)
+        all_locs = self.req_to_token_pool.req_to_token[
+            rid, : req.kv.kv_allocated_len
+        ].to(torch.int64)
+        self.allocator.logical_attn_allocator.free(all_locs)
+        self._free_req_slot(req)
+        self._assert_sizes_restored(initial, "spec_ring_wrap")
+
+    def test_spec_mode_allocates_full_device_buffer(self):
+        """With the ring enabled, verify's eviction slow path may DMA into any
+        LRU slot, so alloc_device_buffer must provision every padded slot."""
+        initial = self._get_initial_sizes()
+        self._enable_spec_ring(self.page_size)
+
+        fill_len = self.page_size
+        req = _make_req("spec-full-buffer", list(range(fill_len)))
+        self._alloc_req_slot(req)
+        kv_loc = self._alloc_kv(req, fill_len)
+
+        self.coordinator.alloc_device_buffer(req)
+        rid = req.req_pool_idx
+        self.assertEqual(
+            int(self.coordinator.req_device_buffer_size[rid]),
+            self.coordinator.padded_buffer_size,
+        )
+        locs = self.coordinator.req_device_buffer_token_locs[0, rid]
+        self.assertTrue(
+            torch.all(locs[: self.coordinator.padded_buffer_size] >= 0),
+            "unallocated buffer slots would be invalid DMA destinations",
+        )
+
+        self.coordinator.request_finished(req)
+        self.allocator.logical_attn_allocator.free(kv_loc)
+        self._free_req_slot(req)
+        self._assert_sizes_restored(initial, "spec_full_buffer")
+
+    def test_admit_long_prompt_reclaims_deferred_pages_for_ring(self):
+        """Staging transient peak: a long prompt holds nearly the whole
+        physical pool until the staging DMA completes (surplus pages are
+        deferred-freed), while the ring is allocated immediately. The ring
+        allocation must reclaim deferred pages instead of raising."""
+        if self.page_size == 1:
+            self.skipTest("deferred-page accounting requires page_size > 1")
+        initial = self._get_initial_sizes()
+        R = 2 * self.page_size
+        self._enable_spec_ring(R)
+
+        # Leave only one free page — less than the ring needs.
+        fill_len = SIZE - self.page_size
+        req = _make_req("staging-peak", list(range(fill_len)))
+        self._alloc_req_slot(req)
+        self._alloc_kv(req, fill_len)
+        self.assertLess(
+            self.allocator.hisparse_attn_allocator.available_size(), R,
+            "precondition: free pool must be smaller than the ring",
+        )
+
+        self.coordinator.admit_request_into_staging(req)
+        self.assertTrue(self.coordinator.req_spec_ring_active[req.req_pool_idx])
+
+        self.coordinator.request_finished(req)
+        all_locs = self.req_to_token_pool.req_to_token[
+            req.req_pool_idx, :fill_len
+        ].to(torch.int64)
+        self.allocator.logical_attn_allocator.free(all_locs)
+        self._free_req_slot(req)
+        self._assert_sizes_restored(initial, "staging_peak_ring")
 
 
 if __name__ == "__main__":

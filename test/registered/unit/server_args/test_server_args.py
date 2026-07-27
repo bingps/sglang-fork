@@ -392,6 +392,82 @@ class TestHiSparseDsaBackendPolicy(unittest.TestCase):
             server_args._validate_hisparse_kv_cache_dtype()
 
 
+class TestHiSparseSpeculativeGuards(unittest.TestCase):
+    """Startup guards for --enable-hisparse + speculative decoding (REVIEW P1
+    findings). Tree drafting (topk > 1), non-DSA STANDALONE drafts, PD
+    disaggregation and decode-side KV offload each bypass the HiSparse
+    logical->physical mapping or the per-request resource cleanup, so they are
+    rejected at launch instead of failing (or corrupting KV) at runtime."""
+
+    @staticmethod
+    def _spec_args(**kw):
+        base = dict(
+            speculative_algorithm="EAGLE",
+            speculative_eagle_topk=1,
+            disaggregation_mode="null",
+            enable_multi_layer_eagle=False,
+        )
+        base.update(kw)
+        return SimpleNamespace(**base)
+
+    def test_rejects_non_eagle_algorithm(self):
+        from sglang.srt.arg_groups.hisparse_hook import (
+            _validate_hisparse_speculative_algorithm,
+        )
+
+        with self.assertRaisesRegex(ValueError, "only supported for"):
+            _validate_hisparse_speculative_algorithm(
+                self._spec_args(speculative_algorithm="STANDALONE")
+            )
+
+    def test_rejects_tree_topk(self):
+        from sglang.srt.arg_groups.hisparse_hook import (
+            _validate_hisparse_speculative_algorithm,
+        )
+
+        with self.assertRaisesRegex(ValueError, "linear draft chain"):
+            _validate_hisparse_speculative_algorithm(
+                self._spec_args(speculative_eagle_topk=4)
+            )
+
+    def test_rejects_pd_disaggregation(self):
+        from sglang.srt.arg_groups.hisparse_hook import (
+            _validate_hisparse_speculative_algorithm,
+        )
+
+        with self.assertRaisesRegex(ValueError, "PD disaggregation"):
+            _validate_hisparse_speculative_algorithm(
+                self._spec_args(disaggregation_mode="decode")
+            )
+
+    @patch("sglang.srt.arg_groups.overrides.resolved_view")
+    def test_accepts_linear_eagle_chain(self, mock_view):
+        from sglang.srt.arg_groups.hisparse_hook import (
+            _validate_hisparse_speculative_algorithm,
+        )
+
+        mock_view.return_value = SimpleNamespace(dsa_decode_backend="flashmla_sparse")
+        # topk=1 EAGLE with no disaggregation must pass all spec guards.
+        _validate_hisparse_speculative_algorithm(self._spec_args())
+
+    @patch("sglang.srt.arg_groups.hisparse_hook._is_hip", return_value=False)
+    @patch("sglang.srt.configs.model_config.is_deepseek_v4", return_value=False)
+    @patch("sglang.srt.configs.model_config.is_deepseek_dsa", return_value=True)
+    def test_rejects_decode_kvcache_offload(self, *_mocks):
+        from sglang.srt.arg_groups.hisparse_hook import validate_hisparse
+
+        hf = SimpleNamespace(architectures=["DeepseekV32ForCausalLM"])
+        server_args = SimpleNamespace(
+            enable_hisparse=True,
+            disable_radix_cache=True,
+            disaggregation_decode_enable_offload_kvcache=True,
+            speculative_algorithm=None,
+            get_model_config=lambda: SimpleNamespace(hf_config=hf),
+        )
+        with self.assertRaisesRegex(ValueError, "offload"):
+            validate_hisparse(server_args)
+
+
 class TestFa4PageSizeAutoForce(CustomTestCase):
     """FA4 requires page_size 128 for non-MLA models on SM100. The auto-force
     must trigger for `--attention-backend fa4` (combined) too, not only for the

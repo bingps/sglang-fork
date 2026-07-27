@@ -239,11 +239,23 @@ class SchedulerBatchResultProcessor:
                     if req.finished():
                         self._maybe_collect_routed_experts(req)
                         self._maybe_collect_indexer_topk(req)
+                        if self.server_args.enable_hisparse:
+                            # The eagle worker admits prefill reqs eagerly
+                            # (buffer + staging ring); a req finishing at
+                            # prefill must release them here or the reused
+                            # req slot leaks the pages and skips re-admission.
+                            self.hisparse_coordinator.request_finished(req)
                         release_kv_cache(req, self.tree_cache)
                         req.time_stats.set_completion_time()
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
                         maybe_cache_unfinished_req(req, self.tree_cache)
-                        if self.server_args.enable_hisparse:
+                        if (
+                            self.server_args.enable_hisparse
+                            and self.hisparse_coordinator.req_device_buffer_size[
+                                req.req_pool_idx
+                            ]
+                            == 0
+                        ):
                             self.hisparse_coordinator.admit_request_into_staging(req)
 
                     self._maybe_collect_customized_info(i, req, logits_output)

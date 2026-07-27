@@ -145,10 +145,17 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 and int(eagle_draft_num_layers) > 0
                 and int(num_layers) > 0
             ):
-                self._cell_size = int(
-                    self._cell_size
-                    * (1 + int(eagle_draft_num_layers) / int(num_layers))
-                )
+                draft_fraction = int(eagle_draft_num_layers) / int(num_layers)
+                if kvc.server_args.enable_hisparse:
+                    # The HiSparse draft pool spans the target's LOGICAL space
+                    # (max_total_num_tokens * host_to_device_ratio), so its KV
+                    # is that many times the per-layer budget above.
+                    from sglang.srt.mem_cache.sparsity import parse_hisparse_config
+
+                    draft_fraction *= parse_hisparse_config(
+                        kvc.server_args
+                    ).host_to_device_ratio
+                self._cell_size = int(self._cell_size * (1 + draft_fraction))
 
         # DFLASH/DSPARK: scale cell_size to account for draft model KV cache
         if kvc.spec_algorithm.is_dflash_family() and not kvc.is_draft_worker:

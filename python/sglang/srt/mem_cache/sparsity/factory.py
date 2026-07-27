@@ -84,6 +84,34 @@ def _parse_sparse_config(server_args) -> SparseConfig:
         raise ValueError(
             f"device_buffer_size ({device_buffer_size}) must be no smaller than top_k ({top_k})"
         )
+    # alloc_device_buffer requires page-aligned sizes (padded_buffer_size =
+    # device_buffer_size + page keeps the remainder), so a misaligned value
+    # would only fail at the first staging. Round up here so the concurrency
+    # budget, coordinator tensors, and kernel parameters all agree.
+    kv_page_size = server_args.page_size or 1
+    if kv_page_size > 1 and device_buffer_size % kv_page_size != 0:
+        aligned = (
+            (device_buffer_size + kv_page_size - 1) // kv_page_size
+        ) * kv_page_size
+        logger.warning(
+            "hisparse device_buffer_size (%d) is not a multiple of the KV "
+            "page size (%d); rounding up to %d.",
+            device_buffer_size,
+            kv_page_size,
+            aligned,
+        )
+        device_buffer_size = aligned
+    # LRU slot ids are int16 (coordinator `lru_slots`, kernel `int16_t
+    # evict_slot`), so slot indices must stay in [0, 32767]: a larger buffer
+    # wraps negative and the kernel indexes req_device_buffer_locs out of
+    # bounds. Reject here instead of corrupting KV at the first swap-in.
+    if device_buffer_size > 32768:
+        raise ValueError(
+            f"device_buffer_size ({device_buffer_size}) must be no larger than "
+            "32768: HiSparse LRU slot ids are int16. Reduce device_buffer_size "
+            "(or migrate the slot dtype to int32 across Python, wrapper and "
+            "CUDA kernel)."
+        )
     if not isinstance(swap_in_block_size, int) or isinstance(swap_in_block_size, bool):
         raise ValueError(
             f"swap_in_block_size must be an integer, got {swap_in_block_size!r}"

@@ -792,19 +792,23 @@ class ModelRunner:
         self.graph_shared_output = None
 
     def maybe_init_hisparse_coordinator(self):
-        if not self.enable_hisparse:
+        if not self.enable_hisparse or self.is_draft_worker:
             return
-        from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
+        from sglang.srt.managers.hisparse_coordinator import (
+            HiSparseCoordinator,
+            HiSparseMTPCoordinator,
+            hisparse_spec_ring_capacity,
+        )
         from sglang.srt.mem_cache.sparsity import parse_hisparse_config
 
         hisparse_cfg = parse_hisparse_config(self.server_args)
-        hisparse_top_k = getattr(
-            self.model_config.hf_text_config, "index_topk", hisparse_cfg.top_k
-        )
-        self.hisparse_coordinator = HiSparseCoordinator(
+        spec_ring_capacity = hisparse_spec_ring_capacity(self.server_args)
+        shared_kwargs = dict(
             req_to_token_pool=self.req_to_token_pool,
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-            top_k=hisparse_top_k,
+            top_k=getattr(
+                self.model_config.hf_text_config, "index_topk", hisparse_cfg.top_k
+            ),
             device_buffer_size=hisparse_cfg.device_buffer_size,
             device=self.device,
             tp_group=(
@@ -815,6 +819,14 @@ class ModelRunner:
             host_to_device_ratio=hisparse_cfg.host_to_device_ratio,
             swap_in_block_size=hisparse_cfg.swap_in_block_size,
         )
+        if spec_ring_capacity > 0:
+            self.hisparse_coordinator = HiSparseMTPCoordinator(
+                **shared_kwargs,
+                num_draft_tokens=self.server_args.max_speculative_num_draft_tokens or 1,
+                spec_ring_capacity=spec_ring_capacity,
+            )
+        else:
+            self.hisparse_coordinator = HiSparseCoordinator(**shared_kwargs)
 
     def post_capture_resize_kv_pool(self):
         resize = compute_post_capture_kv_resize(self)
@@ -1438,12 +1450,24 @@ class ModelRunner:
             )
 
             if (
-                forward_batch.forward_mode.is_decode()
+                (
+                    forward_batch.forward_mode.is_decode()
+                    or forward_batch.forward_mode.is_target_verify()
+                )
                 and self.hisparse_coordinator is not None
             ):
                 forward_batch.hisparse_coordinator = self.hisparse_coordinator
                 self.hisparse_coordinator.wait_for_pending_backup()
-                self.hisparse_coordinator.num_real_reqs.fill_(forward_batch.batch_size)
+                if (
+                    forward_batch.forward_mode.is_target_verify()
+                    and self.hisparse_coordinator.has_ongoing_staging()
+                ):
+                    # The verify swap-in kernel may DMA freshly staged prefill
+                    # tokens from host; order it after the staging DMA on the
+                    # GPU instead of stalling the CPU with a synchronize.
+                    torch.get_device_module(self.device).current_stream().wait_stream(
+                        self.hisparse_coordinator.write_staging_stream
+                    )
 
             # Replay cuda graph if applicable
             if can_run_graph:

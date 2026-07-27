@@ -58,6 +58,7 @@ class HiSparseDSATokenToKVPool(DSATokenToKVPool):
             index_buf_size=size * host_to_device_ratio,
         )
         self.bytes_per_token = self.kv_cache_dim * self.dtype.itemsize
+        self.full_to_hisparse_device_index_mapping = None
 
     def register_mapping(self, full_to_hisparse_device_index_mapping: torch.Tensor):
         self.full_to_hisparse_device_index_mapping = (
@@ -65,9 +66,13 @@ class HiSparseDSATokenToKVPool(DSATokenToKVPool):
         )
 
     def translate_loc_to_hisparse_device(self, compressed_indices: torch.Tensor):
+        if self.full_to_hisparse_device_index_mapping is None:
+            return compressed_indices
         return self.full_to_hisparse_device_index_mapping[compressed_indices]
 
     def _translate_loc_to_hisparse_device(self, compressed_indices: torch.Tensor):
+        if self.full_to_hisparse_device_index_mapping is None:
+            return compressed_indices
         return self.full_to_hisparse_device_index_mapping[compressed_indices]
 
     def translate_loc_from_full_to_hisparse_device(self, full_indices: torch.Tensor):

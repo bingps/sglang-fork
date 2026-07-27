@@ -2742,7 +2742,18 @@ class Scheduler(
                 self.stash_chunked_request(self.chunked_req)
 
         # HiSparse has its own prefill-to-decode transition; skip last_batch merge.
-        if self.enable_hisparse:
+        # When speculative decoding is enabled, hisparse requests join the
+        # normal MTP running batch — no separate hisparse decode batch. The
+        # coordinator is attached at the END of this method: the merge below
+        # may replace the running_batch object outright (empty running_batch
+        # -> running_batch = last_batch), dropping dynamic attributes.
+        if self.enable_hisparse and not self.spec_algorithm.is_none():
+            ready_reqs = self.hisparse_coordinator.collect_ready_reqs()
+            if len(ready_reqs) > 0:
+                for req in ready_reqs:
+                    req.hisparse_staging = False
+                running_batch.batch_is_full = False
+        elif self.enable_hisparse:
             ready_reqs = self.hisparse_coordinator.collect_ready_reqs()
             if len(ready_reqs) > 0:
                 new_batch = self._build_hisparse_decode_batch(ready_reqs)
@@ -2755,7 +2766,7 @@ class Scheduler(
             running_batch.batch_is_full = False
 
         if (
-            not self.enable_hisparse
+            (not self.enable_hisparse or not self.spec_algorithm.is_none())
             and last_batch
             and last_batch.forward_mode.is_extend()
         ):
@@ -2780,6 +2791,15 @@ class Scheduler(
                 else:
                     # Merge running_batch with prefill batch
                     running_batch.merge_batch(last_batch)
+
+        # HiSparse + MTP: attach the coordinator only after the merge above
+        # settles. `running_batch = last_batch` replaces the object outright,
+        # so an earlier-attached dynamic attribute would be dropped and the
+        # first decode round would silently fall back to the combined
+        # physical allocator (spec KV landing in LRU-managed buffer slots).
+        # eagle_prepare_for_decode fail-fasts if the attribute is missing.
+        if self.enable_hisparse and not self.spec_algorithm.is_none():
+            running_batch.hisparse_coordinator = self.hisparse_coordinator
 
         # For prefill-only batch, filter out finished requests since they
         # won't go through the decode step. This keeps running_batch accurate
@@ -2840,7 +2860,14 @@ class Scheduler(
         return NextBatchPlan(batch_to_run=ret, running_batch=running_batch)
 
     def get_num_allocatable_reqs(self, running_bs):
-        res = get_parallel().pp_max_micro_batch_size - running_bs
+        # pp_max_micro_batch_size defaults to max_running_requests // pp_size,
+        # but an explicitly larger CLI value must not bypass the concurrency
+        # cap (max_running_requests may be clamped further, e.g. by the
+        # HiSparse fixed per-request physical footprint).
+        res = (
+            min(get_parallel().pp_max_micro_batch_size, self.max_running_requests)
+            - running_bs
+        )
         res = min(res, self.req_to_token_pool.available_size())
         return res
 

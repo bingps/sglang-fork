@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import logging
 import math
 from enum import IntEnum
@@ -554,6 +555,10 @@ def eagle_prepare_for_verify(
             verify_forward_batch
         )
     )
+    if target_worker.model_runner.hisparse_coordinator is not None:
+        verify_forward_batch.hisparse_coordinator = (
+            target_worker.model_runner.hisparse_coordinator
+        )
     if can_run_cuda_graph:
         target_worker.model_runner.decode_cuda_graph_runner.load_batch(
             verify_forward_batch
@@ -803,6 +808,16 @@ def eagle_sample(
 def eagle_prepare_for_decode(batch: ScheduleBatch):
     batch.maybe_evict_swa()
 
+    # HiSparse with MTP: backup newly committed tokens to host before
+    # the next verify step.  kv_committed_len was updated by
+    # process_batch_result_decode in the previous round.
+    hisparse_coord = batch.hisparse_coordinator
+    if hisparse_coord is not None:
+        hisparse_coord.backup_committed_tokens(batch.reqs)
+        # Order this round's verify (host-pool reads on top-k miss) after the
+        # admission staging DMA of any request on its first verify.
+        hisparse_coord.wait_admission_staging_before_verify(batch.reqs)
+
     bs = batch.batch_size()
 
     # Accumulate penalty
@@ -863,15 +878,43 @@ def eagle_prepare_for_decode(batch: ScheduleBatch):
     reqs = batch.reqs
     cur_kv_lens = cur_kv_lens_device
     nxt_kv_lens = nxt_kv_lens_device
-    alloc_for_spec_decode(
-        tree_cache,
-        req_to_token_pool,
-        reqs=reqs,
-        req_pool_indices=req_pool_indices,
-        cur_kv_lens=cur_kv_lens,
-        cur_kv_lens_cpu=cur_kv_lens_cpu,
-        nxt_kv_lens=nxt_kv_lens,
-        nxt_kv_lens_cpu=nxt_kv_lens_cpu,
-        num_needed_tokens=num_needed_tokens,
-        batch=batch,
+    if hisparse_coord is None and reqs and get_server_args().enable_hisparse:
+        # A silent fallback to the combined allocator would place speculative
+        # KV on freshly allocated physical pages continuing from buffer/ring
+        # slots (LRU may evict them later -> wrong KV) and break the fixed
+        # per-request footprint. Fail loudly instead.
+        raise RuntimeError(
+            "HiSparse is enabled but the decode batch carries no "
+            "hisparse_coordinator; the scheduler must attach it after the "
+            "last_batch merge (batch replacement drops dynamic attributes)."
+        )
+    # HiSparse: speculative physical slots come from the per-request staging
+    # ring (below), not the global hisparse pool — scope the allocator to
+    # logical-only so the shared allocation helpers need no mode parameter.
+    spec_alloc_ctx = (
+        batch.token_to_kv_pool_allocator.spec_logical_alloc()
+        if hisparse_coord is not None
+        else contextlib.nullcontext()
     )
+    with spec_alloc_ctx:
+        alloc_for_spec_decode(
+            tree_cache,
+            req_to_token_pool,
+            reqs=reqs,
+            req_pool_indices=req_pool_indices,
+            cur_kv_lens=cur_kv_lens,
+            cur_kv_lens_cpu=cur_kv_lens_cpu,
+            nxt_kv_lens=nxt_kv_lens,
+            nxt_kv_lens_cpu=nxt_kv_lens_cpu,
+            num_needed_tokens=num_needed_tokens,
+            batch=batch,
+        )
+
+    # HiSparse staging ring: point the newly reserved logical slots at ring
+    # physical slots (position % capacity) and recycle the slots of long-
+    # committed positions. Also registers positions for the verify swap-in
+    # kernel's host-DMA lookup. Batched: constant launch count per round.
+    if hisparse_coord is not None:
+        hisparse_coord.assign_spec_ring_slots_batch(
+            reqs, cur_kv_lens_cpu.tolist(), nxt_kv_lens_cpu.tolist()
+        )

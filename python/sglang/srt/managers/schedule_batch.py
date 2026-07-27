@@ -1083,6 +1083,12 @@ class Req(ReqDllmMixin):
 
         # For hisparse
         self.hisparse_staging = False
+        # Speculative (MTP) per-request tracking, owned by
+        # HiSparseMTPCoordinator: last position backed up to host, and the
+        # first position that was ring-assigned. None until the request is
+        # admitted into the speculative staging ring.
+        self.hisparse_last_backed_len: Optional[int] = None
+        self.hisparse_ring_start: Optional[int] = None
 
     @property
     def seqlen(self) -> int:

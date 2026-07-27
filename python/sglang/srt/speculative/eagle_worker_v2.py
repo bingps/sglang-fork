@@ -1157,6 +1157,34 @@ class EAGLEWorkerV2(BaseSpecWorker):
                         batch_output.logits_output.mm_input_embeds,
                     )
                 )
+                # HiSparse + MTP: trigger staging + eager buffer alloc now so
+                # the first verify has valid device buffer data. This must
+                # happen inside the eagle_worker (not the scheduler) because
+                # the overlap scheduler's process_batch_result sees the batch
+                # as DECODE (forward_mode is mutated) and skips staging.
+                hisparse_coord = (
+                    self.target_worker.model_runner.hisparse_coordinator
+                )
+                if hisparse_coord is not None:
+                    for req in batch.reqs:
+                        if (
+                            not req.finished()
+                            and not req.hisparse_staging
+                            # Chunked prefill: admit only after the LAST chunk.
+                            # Mid-chunk admission moves the first-chunk KV into
+                            # the fixed device buffer and CLEARS the global
+                            # logical->physical mapping of everything else, so
+                            # the next chunk's prefill attention translates
+                            # those logical ids to slot 0 (garbage KV: ~43% of
+                            # the layer-0 page table in the repro) and later
+                            # chunks' pages bypass staging entirely.
+                            and req.extend_range.end >= len(req.origin_input_ids)
+                            and int(
+                                hisparse_coord.req_device_buffer_size[req.req_pool_idx]
+                            )
+                            == 0
+                        ):
+                            hisparse_coord.admit_request_into_staging(req)
                 return batch_output
         else:
             self.activate_step_by_batch(batch.seq_lens.shape[0])
