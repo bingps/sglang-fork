@@ -66,6 +66,23 @@ class DecodeHiCachePreallocMixin:
         """
         prefix_indices = result.device_indices
         l1_prefix_len = len(prefix_indices)
+
+        # The decode-side L2/L3 local-restore machinery (query_storage_hit_length
+        # here + the is_load_back_event_done state machine in
+        # _process_hicache_local_restores) is HiRadixCache-only. UnifiedRadixCache
+        # (selected for DSA / hybrid models with --enable-hierarchical-cache)
+        # lacks it, and a request with a reported L2/L3 hit would be held in
+        # PENDING forever by pop_transferred. Report a device-only (L1) match
+        # instead — the host/storage continuation is re-fetched from the prefill.
+        if not hasattr(self.tree_cache, "is_load_back_event_done"):
+            return DecodePrefixMatch(
+                prefix_indices=prefix_indices,
+                l2_host_hit_length=0,
+                l3_storage_hit_length=0,
+                last_device_node=result.last_device_node,
+                last_host_node=None,
+            )
+
         l2_host_hit_length = result.host_hit_length
 
         l3_storage_hit_length = 0
@@ -240,9 +257,6 @@ class DecodeHiCacheTransferMixin:
         return True
 
     def _process_hicache_local_restores(self, decode_reqs: List[DecodeRequest]) -> None:
-        if not hasattr(self.tree_cache, "is_load_back_event_done"):
-            return
-
         # Filter once: keep only PENDING reqs that still need restore work;
         # trivially-done reqs (no prefix_match / nothing to restore) flip to READY.
         active: List[DecodeRequest] = []
@@ -254,6 +268,14 @@ class DecodeHiCacheTransferMixin:
                 dr.hicache_restore_status = HiCacheRestoreResult.READY
                 continue
             active.append(dr)
+
+        # The load-back state machine below is HiRadixCache-only. Trees without
+        # is_load_back_event_done (UnifiedRadixCache) never produce
+        # needs_local_restore matches (_build_decode_prefix_match reports
+        # L1-only), so `active` is empty — but the trivial flip above must still
+        # run or every request would be held PENDING forever by pop_transferred.
+        if not hasattr(self.tree_cache, "is_load_back_event_done"):
+            return
 
         # Phase A: advance in-flight DMAs to READY.
         for dr in active:
