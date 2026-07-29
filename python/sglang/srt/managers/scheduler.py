@@ -957,12 +957,35 @@ class Scheduler(
 
     def init_hisparse_coordinator(self) -> None:
         self.hisparse_coordinator: Optional[HiSparseCoordinator] = None
+        self.hybrid_controller = None
         if not self.enable_hisparse:
             return
 
         # Coordinator was created inside ModelRunner.initialize() before CUDA graph capture.
         self.hisparse_coordinator = self.tp_worker.model_runner.hisparse_coordinator
         self.hisparse_coordinator.set_decode_producer_stream(self.forward_stream)
+
+        # HiSparse<->MTP hybrid: build the mode controller and hang it off the
+        # coordinator so the eagle worker (admission) and the scheduler (batch
+        # gating) read a single source of truth for the current decode mode.
+        if self.server_args.enable_hisparse_mtp_hybrid:
+            from sglang.srt.speculative.hybrid_mode_controller import (
+                HybridModeController,
+            )
+
+            self.hybrid_controller = HybridModeController(
+                self.hisparse_coordinator,
+                self.hisparse_coordinator.token_to_kv_pool_allocator,
+                usage_threshold_up=self.server_args.hisparse_mtp_usage_up,
+                usage_threshold_down=self.server_args.hisparse_mtp_usage_down,
+                min_bsz_for_hisparse=self.server_args.hisparse_mtp_min_bsz,
+                max_bsz_for_mtp=self.server_args.hisparse_mtp_max_bsz_for_mtp,
+                cooldown_steps=self.server_args.hisparse_mtp_cooldown_steps,
+                # DP cross-rank mode agreement lands in Phase 7.
+                tp_group=None,
+            )
+            self.hisparse_coordinator.hybrid_controller = self.hybrid_controller
+
 
     def init_running_status(self):
         # Set by the ShutdownReq handler to break the event loop for graceful shutdown.
@@ -2798,8 +2821,25 @@ class Scheduler(
         # first decode round would silently fall back to the combined
         # physical allocator (spec KV landing in LRU-managed buffer slots).
         # eagle_prepare_for_decode fail-fasts if the attribute is missing.
+        #
+        # Hybrid: in the resident (pure-MTP) mode the batch runs without a
+        # coordinator (attention translates logical->physical directly), so
+        # detach it and mark the batch resident. hisparse_resident lets
+        # eagle_prepare_for_decode distinguish a legitimately-resident batch
+        # from the dropped-attribute bug the fail-fast guards against.
         if self.enable_hisparse and not self.spec_algorithm.is_none():
-            running_batch.hisparse_coordinator = self.hisparse_coordinator
+            # Hybrid: decide the mode and migrate in-flight requests BEFORE the
+            # attach below, so the batch and its requests agree on the layout.
+            if self.hybrid_controller is not None and running_batch.reqs:
+                self.hybrid_controller.on_step(
+                    len(running_batch.reqs), running_batch.reqs
+                )
+            if self.hisparse_coordinator.attaches_to_batch():
+                running_batch.hisparse_coordinator = self.hisparse_coordinator
+                running_batch.hisparse_resident = False
+            else:
+                running_batch.hisparse_coordinator = None
+                running_batch.hisparse_resident = True
 
         # For prefill-only batch, filter out finished requests since they
         # won't go through the decode step. This keeps running_batch accurate

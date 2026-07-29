@@ -548,6 +548,11 @@ def eagle_prepare_for_verify(
         return_hidden_states_before_norm=False,
     )
 
+    if target_worker.model_runner.hisparse_coordinator is not None:
+        verify_forward_batch.hisparse_coordinator = (
+            target_worker.model_runner.hisparse_coordinator
+        )
+
     # Run attention backend plan and cuda graph preparation
     can_run_cuda_graph = bool(
         target_worker.model_runner.decode_cuda_graph_runner
@@ -555,10 +560,6 @@ def eagle_prepare_for_verify(
             verify_forward_batch
         )
     )
-    if target_worker.model_runner.hisparse_coordinator is not None:
-        verify_forward_batch.hisparse_coordinator = (
-            target_worker.model_runner.hisparse_coordinator
-        )
     if can_run_cuda_graph:
         target_worker.model_runner.decode_cuda_graph_runner.load_batch(
             verify_forward_batch
@@ -878,11 +879,21 @@ def eagle_prepare_for_decode(batch: ScheduleBatch):
     reqs = batch.reqs
     cur_kv_lens = cur_kv_lens_device
     nxt_kv_lens = nxt_kv_lens_device
-    if hisparse_coord is None and reqs and get_server_args().enable_hisparse:
+    if (
+        hisparse_coord is None
+        and reqs
+        and get_server_args().enable_hisparse
+        and not batch.hisparse_resident
+    ):
         # A silent fallback to the combined allocator would place speculative
         # KV on freshly allocated physical pages continuing from buffer/ring
         # slots (LRU may evict them later -> wrong KV) and break the fixed
         # per-request footprint. Fail loudly instead.
+        #
+        # Hybrid resident batches legitimately carry no coordinator: they run
+        # pure MTP and DO want the combined allocator (KV stays device-resident
+        # with a valid logical->physical mapping), so hisparse_resident exempts
+        # them from this guard.
         raise RuntimeError(
             "HiSparse is enabled but the decode batch carries no "
             "hisparse_coordinator; the scheduler must attach it after the "

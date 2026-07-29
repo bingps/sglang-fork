@@ -195,6 +195,20 @@ class TestHiSparseUnit(unittest.TestCase):
             # Eager admission-time alloc (deferred surplus pages) is MTP-only.
             "test_staging_defers_surplus_pages_until_backup_finishes",
             "test_staging_action_survives_eager_allocation_failure",
+            # Hybrid: resident free path exercises the MTP coordinator override.
+            "test_resident_request_finished_no_leak",
+            # Hybrid: mid-decode offload migration needs buffer + spec ring.
+            "test_offload_running_request_migrates_resident_req",
+            "test_offload_then_restore_round_trip",
+            "test_restore_drains_inflight_staging",
+            # Hybrid single-graph: resident rows run the verify swap-in kernel.
+            "test_resident_verify_swap_in_is_pure_gather",
+            # DP padding rows must not be treated as real requests.
+            "test_verify_swap_in_ignores_dp_padding_rows",
+            # Offloaded MTP consumes logical slots only; memcheck must agree.
+            "test_offloaded_decode_memcheck_uses_logical_capacity",
+            # Headroom gate must credit each request's own reclaimable surplus.
+            "test_hybrid_offload_proceeds_when_surplus_funds_migration",
         }
         self.coordinator = (
             self.mtp_coordinator
@@ -956,6 +970,791 @@ class TestHiSparseUnit(unittest.TestCase):
         self.allocator.logical_attn_allocator.free(torch.cat([kv_loc, out_loc]))
         self._free_req_slot(req)
         self._assert_sizes_restored(initial, "decode_remap")
+
+    # ==================================================================
+    # Test: HiSparse<->MTP hybrid (Phase 2 batch-level gating)
+    # ==================================================================
+    def test_hybrid_mode_gating_predicates(self):
+        """should_admit_new / attaches_to_batch follow the controller mode; a
+        non-hybrid coordinator (no controller) always runs the offloaded path."""
+        from sglang.srt.speculative.hybrid_mode_controller import (
+            DecodeMode,
+            HybridModeController,
+        )
+
+        coord = self.coordinator
+        # Non-hybrid: no controller -> always admit + always attach.
+        self.assertIsNone(coord.hybrid_controller)
+        self.assertTrue(coord.should_admit_new())
+        self.assertTrue(coord.attaches_to_batch())
+
+        controller = HybridModeController(
+            coord,
+            self.allocator,
+            usage_threshold_up=0.6,
+            usage_threshold_down=0.3,
+            min_bsz_for_hisparse=8,
+            max_bsz_for_mtp=4,
+            cooldown_steps=0,
+        )
+        coord.hybrid_controller = controller
+        try:
+            # mode -> (admits_offloaded, attaches_coordinator)
+            expected = {
+                DecodeMode.MTP: (False, False),
+                DecodeMode.PENDING_OFFLOAD: (True, False),
+                DecodeMode.HISPARSE: (True, True),
+                DecodeMode.PENDING_RESTORE: (False, True),
+            }
+            for mode, (admit, attach) in expected.items():
+                controller.current_mode = mode
+                self.assertEqual(coord.should_admit_new(), admit, mode.name)
+                self.assertEqual(coord.attaches_to_batch(), attach, mode.name)
+        finally:
+            # Shared coordinator: do not leak the controller into other tests.
+            coord.hybrid_controller = None
+
+    def test_resident_request_finished_no_leak(self):
+        """A pure-MTP resident request -- allocated via the combined allocator
+        and never admitted into HiSparse -- frees with no leak and no
+        double-free: request_finished reclaims the mapped physical pages and
+        clears the mapping, so the subsequent release_kv_cache free finds
+        nothing left on the hisparse side."""
+        initial = self._get_initial_sizes()
+        fill_len = self.page_size * 2
+        req = _make_req("resident-req", list(range(fill_len)))
+        self._alloc_req_slot(req)
+
+        # alloc_extend (not spec_logical) = combined logical + physical + mapping:
+        # exactly the layout of a prefilled-but-never-admitted resident request.
+        kv_loc = self._alloc_kv(req, fill_len)
+        self.assertEqual(
+            int(self.coordinator.req_device_buffer_size[req.req_pool_idx]),
+            0,
+            "resident request must have no device buffer",
+        )
+        compressed = self.coordinator.mem_pool_device.translate_loc_from_full_to_compressed(
+            kv_loc
+        )
+        mapped = self.allocator.full_to_hisparse_device_index_mapping[compressed]
+        self.assertTrue(
+            torch.all(mapped > 0), "resident mapping must be valid before free"
+        )
+
+        # Mirror the scheduler free order: request_finished then release_kv_cache.
+        self.coordinator.request_finished(req)
+        self.allocator.free(kv_loc)
+        self._free_req_slot(req)
+        self._assert_sizes_restored(initial, "resident request_finished")
+
+    def test_offload_running_request_migrates_resident_req(self):
+        """Mid-decode offload migration: a device-resident request carrying an
+        uncommitted spec look-ahead tail gains a device buffer + staging ring,
+        backs up ONLY the committed prefix, ring-maps the tail (whose resident
+        physical slots were released), and frees with no leak."""
+        initial = self._get_initial_sizes()
+        device = self.allocator.device
+        p = self.page_size
+        committed = 2 * p
+        allocated = 3 * p
+
+        req = _make_req("offload-mig", list(range(committed)))
+        self._alloc_req_slot(req)
+
+        # Resident layout: combined alloc for the committed prefix ...
+        kv_loc = self._alloc_kv(req, committed)
+        self._write_device_patterns(kv_loc, committed)
+        # ... plus the uncommitted look-ahead tail [committed, allocated) that a
+        # running spec-decode request always carries.
+        tail = self.allocator.alloc_extend(
+            prefix_lens=torch.tensor([committed], dtype=torch.int64, device=device),
+            prefix_lens_cpu=torch.tensor([committed], dtype=torch.int64),
+            seq_lens=torch.tensor([allocated], dtype=torch.int64, device=device),
+            seq_lens_cpu=torch.tensor([allocated], dtype=torch.int64),
+            last_loc=kv_loc[-1:],
+            extend_num_tokens=allocated - committed,
+        )
+        self.assertIsNotNone(tail, "look-ahead tail alloc failed")
+        self.req_to_token_pool.write(
+            (req.req_pool_idx, slice(committed, allocated)), tail
+        )
+        req.kv.kv_allocated_len = allocated
+        req.kv_committed_len = committed
+
+        self.coordinator.offload_running_request(req)
+
+        rid = req.req_pool_idx
+        self.assertGreater(
+            int(self.coordinator.req_device_buffer_size[rid]),
+            0,
+            "offload must carve a device buffer",
+        )
+        self.assertTrue(
+            self.coordinator.req_spec_ring_active[rid], "offload must alloc the ring"
+        )
+        # Only the committed prefix is staged, and the backup high-water mark
+        # lands on it so backup_committed_tokens resumes exactly there.
+        self.assertEqual(req.hisparse_last_backed_len, committed)
+        self.assertEqual(
+            int(self.coordinator.req_to_host_pool_allocated_len[rid]), committed
+        )
+        # The ring window is anchored at the migration point.
+        self.assertEqual(req.hisparse_ring_start, committed)
+        # Tail positions resolve through the ring, not stale resident slots.
+        tail_logical = self.req_to_token_pool.req_to_token[
+            rid, committed:allocated
+        ].to(torch.int64)
+        tail_compressed = (
+            self.coordinator.mem_pool_device.translate_loc_from_full_to_compressed(
+                tail_logical
+            )
+        )
+        tail_mapped = self.allocator.full_to_hisparse_device_index_mapping[
+            tail_compressed
+        ]
+        ring = self.coordinator.req_to_spec_ring[rid]
+        self.assertTrue(
+            bool(torch.isin(tail_mapped, ring).all()),
+            "look-ahead tail must map into the spec staging ring",
+        )
+
+        self._collect_ready_reqs_blocking()
+        self._cleanup_req(req, torch.cat([kv_loc, tail]), logical_only=True)
+        self._assert_sizes_restored(initial, "offload_running_request")
+
+    def test_offload_then_restore_round_trip(self):
+        """resident -> offload -> restore: the committed KV survives the host
+        round trip, every allocated position lands back on its own dedicated
+        physical slot, and all HiSparse per-request state is torn down."""
+        initial = self._get_initial_sizes()
+        device = self.allocator.device
+        p = self.page_size
+        committed = 2 * p
+        allocated = 3 * p
+
+        req = _make_req("roundtrip", list(range(committed)))
+        self._alloc_req_slot(req)
+        kv_loc = self._alloc_kv(req, committed)
+        self._write_device_patterns(kv_loc, committed)
+        tail = self.allocator.alloc_extend(
+            prefix_lens=torch.tensor([committed], dtype=torch.int64, device=device),
+            prefix_lens_cpu=torch.tensor([committed], dtype=torch.int64),
+            seq_lens=torch.tensor([allocated], dtype=torch.int64, device=device),
+            seq_lens_cpu=torch.tensor([allocated], dtype=torch.int64),
+            last_loc=kv_loc[-1:],
+            extend_num_tokens=allocated - committed,
+        )
+        self.assertIsNotNone(tail, "look-ahead tail alloc failed")
+        self.req_to_token_pool.write(
+            (req.req_pool_idx, slice(committed, allocated)), tail
+        )
+        req.kv.kv_allocated_len = allocated
+        req.kv_committed_len = committed
+        rid = req.req_pool_idx
+
+        # resident -> offloaded
+        self.coordinator.offload_running_request(req)
+        self._collect_ready_reqs_blocking()
+        self.assertGreater(int(self.coordinator.req_device_buffer_size[rid]), 0)
+
+        # offloaded -> resident
+        self.assertTrue(
+            self.coordinator.restore_running_request(req), "restore must succeed"
+        )
+
+        # HiSparse per-request state fully torn down.
+        self.assertEqual(int(self.coordinator.req_device_buffer_size[rid]), 0)
+        self.assertFalse(self.coordinator.req_spec_ring_active[rid])
+        self.assertEqual(int(self.coordinator.req_to_host_pool_allocated_len[rid]), 0)
+        self.assertIsNone(req.hisparse_last_backed_len)
+        self.assertIsNone(req.hisparse_ring_start)
+
+        # Every allocated position maps to its own dedicated physical slot.
+        logical = self.req_to_token_pool.req_to_token[rid, :allocated].to(torch.int64)
+        compressed = (
+            self.coordinator.mem_pool_device.translate_loc_from_full_to_compressed(
+                logical
+            )
+        )
+        mapped = self.allocator.full_to_hisparse_device_index_mapping[compressed]
+        self.assertTrue(bool((mapped > 0).all()), "resident mapping must be valid")
+        self.assertEqual(
+            int(torch.unique(mapped).numel()),
+            allocated,
+            "restored slots must be distinct (one per position)",
+        )
+
+        # The committed KV came back intact through the host round trip.
+        for i in (0, committed // 2, committed - 1):
+            for lid in range(LAYER_NUM):
+                got = self.device_pool.kv_buffer[lid][mapped[i]]
+                self.assertTrue(
+                    bool((got == self._kv_pattern(lid, i)).all()),
+                    f"KV mismatch after restore at layer {lid} pos {i}",
+                )
+
+        self.coordinator.request_finished(req)
+        self.allocator.logical_attn_allocator.free(torch.cat([kv_loc, tail]))
+        self._free_req_slot(req)
+        self._assert_sizes_restored(initial, "offload_restore_round_trip")
+
+    def test_resident_verify_swap_in_is_pure_gather(self):
+        """Single-graph scheme: a device-resident row through the verify
+        swap-in kernel is a pure gather with zero state change.
+
+        A resident request has a valid mapping for every token, no device
+        buffer and identity tables at -1, so every top-k entry must resolve in
+        the kernel's first-level direct_loc pass (output == mapping[logical])
+        and the all-resolved early-exit must skip the buffer scan / LRU
+        write-back / miss DMA entirely. Deleting this case would let two
+        regressions pass silently: the early-exit degrading (LRU reordered or
+        mapping invalidated for resident rows) and the direct_loc pass
+        misresolving, both of which surface only as a quiet accept-rate drop
+        in the hybrid's resident mode."""
+        device = self.allocator.device
+        fill_len = 2 * self.page_size
+        req = _make_req("resident-gather", list(range(fill_len)))
+        self._alloc_req_slot(req)
+        # Combined alloc: the resident layout -- every logical id mapped.
+        kv_loc = self._alloc_kv(req, fill_len)
+        rid = req.req_pool_idx
+
+        mapping = self.allocator.full_to_hisparse_device_index_mapping
+        lru_before = self.coordinator.lru_slots[0, rid, :].clone()
+        mapping_before = mapping[kv_loc.to(torch.int64)].clone()
+
+        # Verify top-k input carries LOGICAL kv ids (fused-topk output), padded
+        # with -1 like a real underfull selection.
+        n = min(fill_len, TOP_K)
+        sel = torch.randperm(fill_len, device=device)[:n]
+        tokens = kv_loc[sel].to(torch.int32)
+        if n < TOP_K:
+            tokens = torch.cat(
+                [tokens, torch.full((TOP_K - n,), -1, dtype=torch.int32, device=device)]
+            )
+        rpi, sls = self._make_batch_tensors([req], [fill_len])
+        self.coordinator.num_real_reqs[0] = 1
+
+        out = self.coordinator.swap_in_verify_pages(
+            req_pool_indices=rpi,
+            seq_lens=sls,
+            logical_top_k=tokens.unsqueeze(0),
+            layer_id=0,
+            num_positions=1,
+        )
+
+        valid = tokens >= 0
+        expect = mapping[tokens[valid].to(torch.int64)].to(torch.int32)
+        self.assertTrue(
+            torch.equal(out[0][valid].cpu(), expect.cpu()),
+            "resident rows must resolve to mapping[logical] exactly",
+        )
+        if bool((~valid).any()):
+            self.assertTrue(
+                bool((out[0][~valid] == -1).all()), "padding must stay -1"
+            )
+        # Early-exit contract: zero per-request state change.
+        self.assertTrue(
+            torch.equal(self.coordinator.lru_slots[0, rid, :], lru_before),
+            "all-resolved position must not touch the LRU order",
+        )
+        self.assertTrue(
+            bool(
+                (self.coordinator.req_device_buffer_logical_locs[0, rid, :] == -1).all()
+            ),
+            "buffer identity table must stay untouched",
+        )
+        self.assertTrue(
+            torch.equal(mapping[kv_loc.to(torch.int64)], mapping_before),
+            "mapping must not be invalidated for resident rows",
+        )
+
+        self._cleanup_req(req, kv_loc)
+
+    def test_restore_drains_inflight_staging(self):
+        """Restore must resolve the request's in-flight admission staging DMA.
+
+        Bug (review a145b5111 #2): offload queues an async device->host staging
+        action on write_staging_stream; restore_running_request only waited on
+        the forward stream and the DECODE backup stream, then read the host KV
+        and freed the host slots. Restoring before the staging ack (offload
+        during cooldown, or a request admitted right before the switch back)
+        could therefore read half-written host KV and free host slots the DMA
+        was still writing -- and the stale action stayed queued in
+        ack_staging_queue holding its deferred surplus pages.
+
+        The round-trip test masked this by calling _collect_ready_reqs_blocking
+        first; this one restores immediately after offload, with the staging
+        action still queued.
+        """
+        initial = self._get_initial_sizes()
+        p = self.page_size
+        committed = 2 * p
+
+        req = _make_req("restore-inflight", list(range(committed)))
+        self._alloc_req_slot(req)
+        kv_loc = self._alloc_kv(req, committed)
+        self._write_device_patterns(kv_loc, committed)
+        rid = req.req_pool_idx
+
+        self.coordinator.offload_running_request(req)
+        self.assertTrue(
+            any(a.req is req for a in self.coordinator.ack_staging_queue),
+            "precondition: staging action must still be in flight",
+        )
+
+        # No _collect_ready_reqs_blocking here: restore while the DMA is queued.
+        self.assertTrue(self.coordinator.restore_running_request(req))
+
+        self.assertFalse(
+            any(a.req is req for a in self.coordinator.ack_staging_queue),
+            "restore must drain the request's staging action before touching "
+            "the host pool it writes to",
+        )
+        self.assertFalse(req.hisparse_staging)
+        # Drain waited for the DMA, so the restored KV is the fully staged copy.
+        logical = self.req_to_token_pool.req_to_token[rid, :committed].to(torch.int64)
+        compressed = (
+            self.coordinator.mem_pool_device.translate_loc_from_full_to_compressed(
+                logical
+            )
+        )
+        mapped = self.allocator.full_to_hisparse_device_index_mapping[compressed]
+        for i in (0, committed - 1):
+            got = self.device_pool.kv_buffer[0][mapped[i]]
+            self.assertTrue(
+                bool((got == self._kv_pattern(0, i)).all()),
+                f"KV mismatch after inflight restore at pos {i}",
+            )
+
+        self.coordinator.request_finished(req)
+        self.allocator.logical_attn_allocator.free(kv_loc)
+        self._free_req_slot(req)
+        self._assert_sizes_restored(initial, "restore_drains_inflight_staging")
+
+    def test_verify_swap_in_ignores_dp_padding_rows(self):
+        """DP padding rows must never be executed as real requests.
+
+        Bug (review c0b3d6c43 #1): _prepare_eager_forward_batch runs
+        prepare_mlp_sync_batch first, which rewrites forward_batch.batch_size to
+        the DP-PADDED size, and only then fills num_real_reqs from it. The
+        kernel's `bid >= num_real_reqs[0]` guard therefore stops filtering the
+        dummy blocks. Padding fills req_pool_indices with 0
+        (_pad_tensor_to_size default), so on an uneven-DP eager verify the dummy
+        blocks run against request slot 0 -- a DIFFERENT live request's LRU,
+        device buffer and DMA targets.
+
+        This drives the kernel directly with a padded batch and asserts slot 0's
+        state is untouched when num_real_reqs is the true count, and shows what
+        the padded count would let the dummies do.
+        """
+        device = self.allocator.device
+        fill_len = 4 * self.page_size
+
+        # Victim occupies slot 0 and is fully offloaded, so it owns real buffer
+        # and LRU state that dummy blocks (req_pool_indices == 0) would touch.
+        victim = _make_req("dp-victim", list(range(fill_len)))
+        self._alloc_req_slot(victim)
+        self.assertNotEqual(
+            victim.req_pool_idx,
+            0,
+            "ReqToTokenPool reserves index 0 as the padding sentinel row "
+            "(memory_pool.py: free_slots starts at 1), so no live request can "
+            "own it -- that is what makes zero-padded dummy rows harmless",
+        )
+        v_kv = self._alloc_kv(victim, fill_len)
+        self._write_device_patterns(v_kv, fill_len)
+        self.coordinator.admit_request_into_staging(victim)
+        self._collect_ready_reqs_blocking()
+
+        # The one real request of this rank's batch, in a different slot.
+        real = _make_req("dp-real", list(range(fill_len)))
+        self._alloc_req_slot(real)
+        self.assertNotEqual(real.req_pool_idx, 0)
+        r_kv = self._alloc_kv(real, fill_len)
+        self._write_device_patterns(r_kv, fill_len)
+        self.coordinator.admit_request_into_staging(real)
+        self._collect_ready_reqs_blocking()
+
+        # Batch of 1 real request padded to 3 rows exactly as
+        # _pad_tensor_to_size does: zeros for req_pool_indices / seq_lens, and a
+        # zero-filled top-k block per padded row.
+        padded_bs = 3
+        rpi = torch.zeros(padded_bs, dtype=torch.int64, device=device)
+        rpi[0] = real.req_pool_idx
+        sls = torch.zeros(padded_bs, dtype=torch.int32, device=device)
+        sls[0] = fill_len
+        topk = torch.zeros((padded_bs, TOP_K), dtype=torch.int32, device=device)
+        topk[0] = self._build_topk_tokens(fill_len)
+
+        def snapshot():
+            return (
+                self.coordinator.lru_slots[:, 0, :].clone(),
+                self.coordinator.req_device_buffer_token_locs[:, 0, :].clone(),
+                self.coordinator.req_device_buffer_logical_locs[:, 0, :].clone(),
+            )
+
+        def run(num_real):
+            self.coordinator.num_real_reqs[0] = num_real
+            self.coordinator.swap_in_verify_pages(
+                req_pool_indices=rpi,
+                seq_lens=sls,
+                logical_top_k=topk,
+                layer_id=0,
+                num_positions=1,
+            )
+            torch.cuda.synchronize()
+
+        base = snapshot()
+        run(1)  # correct count: dummies filtered, slot 0 must be untouched
+        after_correct = snapshot()
+        for b, a, name in zip(base, after_correct, ("lru", "buf_locs", "buf_ids")):
+            self.assertTrue(
+                torch.equal(b, a),
+                f"slot 0 {name} changed even with the correct num_real_reqs",
+            )
+
+        # The padded count DOES let the dummy rows run (measured: they churn the
+        # sentinel row's lru and buf_ids). That is contained only because index 0
+        # is reserved; assert the live request's own state is never collateral.
+        v_lru = self.coordinator.lru_slots[:, victim.req_pool_idx, :].clone()
+        v_ids = self.coordinator.req_device_buffer_logical_locs[
+            :, victim.req_pool_idx, :
+        ].clone()
+        run(padded_bs)
+        self.assertTrue(
+            torch.equal(v_lru, self.coordinator.lru_slots[:, victim.req_pool_idx, :]),
+            "dummy rows must never touch a live request's LRU",
+        )
+        self.assertTrue(
+            torch.equal(
+                v_ids,
+                self.coordinator.req_device_buffer_logical_locs[
+                    :, victim.req_pool_idx, :
+                ],
+            ),
+            "dummy rows must never touch a live request's buffer identities",
+        )
+
+        for req, kv in ((victim, v_kv), (real, r_kv)):
+            self.coordinator.request_finished(req)
+            self.allocator.logical_attn_allocator.free(kv)
+            self._free_req_slot(req)
+
+    def test_offloaded_decode_memcheck_uses_logical_capacity(self):
+        """Offloaded MTP's decode memcheck must match what it will allocate.
+
+        Bug (review c0b3d6c43 #2): eagle_prepare_for_decode allocates the next
+        speculative slots under spec_logical_alloc() -- LOGICAL ids only, the
+        physical locations come from each request's fixed staging ring. But
+        check_decode_mem gated the step on available_size() =
+        min(logical, physical). Once the fixed buffer+ring footprints fill the
+        physical pool (by design at the concurrency cap), the check reports OOM
+        for an allocation that would succeed, forcing retractions; with one
+        request left, retract_decode aborts it with HTTP 500.
+
+        Squeezes the physical pool to below one page while logical stays ample:
+        an offloaded batch must still pass the memcheck, while a resident batch
+        (combined allocator: logical AND physical per token) must still fail.
+        """
+        from sglang.srt import runtime_context as rc
+        from sglang.srt.managers.schedule_batch import ScheduleBatch
+        from sglang.srt.server_args import ServerArgs
+        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+        page = self.page_size
+        req = _make_req("memcheck", list(range(page)))
+        # On a page boundary, so any reserve > 0 needs one fresh page.
+        req.kv.kv_allocated_len = page
+        req.kv_committed_len = page
+
+        phys = self.allocator.hisparse_attn_allocator
+        holder = phys.alloc(phys.available_size() // page * page)
+        self.assertIsNotNone(holder)
+        self.assertLess(phys.available_size(), page, "physical must be squeezed")
+
+        def batch(offloaded):
+            return ScheduleBatch(
+                reqs=[req],
+                spec_algorithm=SpeculativeAlgorithm.from_string("EAGLE"),
+                tree_cache=None,
+                token_to_kv_pool_allocator=self.allocator,
+                hisparse_coordinator=self.coordinator if offloaded else None,
+                hisparse_resident=not offloaded,
+            )
+
+        rc.reset_context()
+        rc.get_context().set_server_args(
+            ServerArgs(
+                model_path="dummy",
+                speculative_algorithm="EAGLE",
+                speculative_num_steps=1,
+                speculative_eagle_topk=1,
+                speculative_num_draft_tokens=2,
+            )
+        )
+        try:
+            self.assertTrue(
+                batch(offloaded=True).check_decode_mem(),
+                "offloaded step allocates logical-only; a full physical pool "
+                "must not fail the check",
+            )
+            self.assertFalse(
+                batch(offloaded=False).check_decode_mem(),
+                "resident step allocates logical AND physical; a full physical "
+                "pool must fail the check",
+            )
+        finally:
+            rc.reset_context()
+            phys.free(holder)
+
+    def test_hybrid_offload_proceeds_when_surplus_funds_migration(self):
+        """The headroom gate must not reject migrations the reclaim path funds.
+
+        Bug (review c0b3d6c43 #3, a regression from the previous review round's
+        fix): _offload_headroom_ok demanded free physical space for every
+        request's ring + buffer shortfall UP FRONT. But a LONG request funds its
+        own migration: alloc_device_buffer keeps the buffer out of pages the
+        request already owns and defer-frees the surplus, which
+        _reclaim_deferred_staging_pages hands to the ring allocation
+        (test_admit_long_prompt_reclaims_deferred_pages_for_ring proves it with
+        free space smaller than the ring). The pessimistic gate returned False
+        before the first migration, and since refusing changes nothing, every
+        later step refused again -- pinning the hybrid to resident exactly when
+        memory pressure is highest, until retract/OOM.
+
+        Runs the REAL coordinator under the controller with the pool nearly
+        full: the switch must proceed, not postpone.
+        """
+        from sglang.srt.speculative.hybrid_mode_controller import (
+            DecodeMode,
+            HybridModeController,
+        )
+
+        if self.page_size == 1:
+            self.skipTest("deferred-page accounting requires page_size > 1")
+        R = 2 * self.page_size
+        self._enable_spec_ring(R)
+
+        # One long resident request holding all but one page of the physical
+        # pool -- the admit-time reclaim path is what must fund ring+slack.
+        fill_len = SIZE - self.page_size
+        req = _make_req("gate-long", list(range(fill_len)))
+        self._alloc_req_slot(req)
+        self._alloc_kv(req, fill_len)
+        req.kv_committed_len = fill_len
+        self.assertLess(
+            self.allocator.hisparse_attn_allocator.available_size(),
+            R,
+            "precondition: free physical must be below the ring size",
+        )
+
+        ctl = HybridModeController(
+            self.coordinator,
+            self.allocator,
+            usage_threshold_up=0.5,
+            usage_threshold_down=0.25,
+            min_bsz_for_hisparse=1,
+            max_bsz_for_mtp=0,
+            cooldown_steps=0,
+        )
+        mode = ctl.on_step(1, [req])
+
+        self.assertEqual(
+            mode,
+            DecodeMode.HISPARSE,
+            "the long request's own surplus funds the migration; the gate must "
+            "let it proceed instead of pinning resident under pressure",
+        )
+        self.assertGreater(int(self.coordinator.req_device_buffer_size[req.req_pool_idx]), 0)
+        self.assertTrue(self.coordinator.req_spec_ring_active[req.req_pool_idx])
+
+        self._collect_ready_reqs_blocking()
+        initial_after = None  # sizes checked via full teardown below
+        self.coordinator.request_finished(req)
+        all_locs = self.req_to_token_pool.req_to_token[
+            req.req_pool_idx, :fill_len
+        ].to(torch.int64)
+        self.allocator.logical_attn_allocator.free(all_locs)
+        self._free_req_slot(req)
+
+    def test_hybrid_controller_projection_breaks_pingpong(self):
+        """The restore decision must use PROJECTED resident usage, not current.
+
+        Offloading is what drops device usage, so comparing the post-offload
+        usage against the down-threshold flip-flops forever (observed live: 72
+        offload + 72 restore transitions in seconds). Projecting what residency
+        would cost keeps the batch offloaded while the load is genuinely heavy,
+        and still restores once it really drains.
+        """
+        from sglang.srt.speculative.hybrid_mode_controller import (
+            DecodeMode,
+            HybridModeController,
+        )
+
+        class _Kv:
+            def __init__(self, a):
+                self.kv_allocated_len = a
+
+        class _Req:
+            def __init__(self, rid, alloc, idx):
+                self.rid, self.kv, self.req_pool_idx = rid, _Kv(alloc), idx
+
+            def finished(self):
+                return False
+
+        class _Alloc:
+            def __init__(self, size, avail):
+                self.size, self._avail = size, avail
+
+            def available_size(self):
+                return self._avail
+
+        class _Coord:
+            def __init__(self, size, used, buf_sizes):
+                self.token_to_kv_pool_allocator = type(
+                    "T", (), {"hisparse_attn_allocator": _Alloc(size, size - used)}
+                )()
+                self.spec_ring_capacity = 256
+                self.req_device_buffer_size = buf_sizes
+                self.restored = []
+                self._size = size
+                self._used = used
+
+            def get_token_stats(self):
+                return type(
+                    "S", (), {"device_token_usage": self._used / self._size}
+                )()
+
+            def offload_running_request(self, req):
+                pass
+
+            def restore_running_request(self, req):
+                self.restored.append(req.rid)
+                return True
+
+        def _controller(coord):
+            return HybridModeController(
+                coord,
+                None,
+                usage_threshold_up=0.5,
+                usage_threshold_down=0.25,
+                min_bsz_for_hisparse=2,
+                max_bsz_for_mtp=1,
+                cooldown_steps=0,
+            )
+
+        # Heavy: 8 offloaded requests of 30k. Current (offloaded) usage 0.147 is
+        # under the down-threshold, but residency would need > 50% of the pool.
+        heavy = [_Req(f"r{i}", 30000, i) for i in range(8)]
+        coord = _Coord(456000, 67000, [8192] * 8)
+        ctl = _controller(coord)
+        self.assertGreater(ctl._projected_resident_usage(heavy), 0.5)
+        ctl.current_mode = DecodeMode.HISPARSE
+        self.assertEqual(
+            ctl.on_step(8, heavy),
+            DecodeMode.HISPARSE,
+            "must not restore into an immediate re-offload",
+        )
+        self.assertEqual(coord.restored, [], "no restore should even be attempted")
+
+        # Genuine drain: two small requests now fit comfortably.
+        light = [_Req("a", 5000, 0), _Req("b", 5000, 1)]
+        coord2 = _Coord(456000, 17000, [8192, 8192])
+        ctl2 = _controller(coord2)
+        self.assertLess(ctl2._projected_resident_usage(light), 0.25)
+        ctl2.current_mode = DecodeMode.HISPARSE
+        self.assertEqual(ctl2.on_step(2, light), DecodeMode.MTP)
+        self.assertEqual(coord2.restored, ["a", "b"])
+
+    def test_hybrid_offload_postponed_without_headroom(self):
+        """The MTP->HiSparse switch must be gated on transient headroom.
+
+        Bug (review a145b5111 #3): the controller assumed offload is always
+        net-freeing and migrated unconditionally. A request SHORTER than the
+        fixed buffer+ring footprint net-allocates, and defer-freed surplus is
+        unavailable until the staging DMA acks -- so with the pool nearly full,
+        alloc_device_buffer could raise mid-migration, escaping the controller
+        with some requests offloaded and some not (a mixed batch) and killing
+        the scheduler. The switch must be postponed instead, and retried once
+        headroom exists.
+        """
+        from sglang.srt.speculative.hybrid_mode_controller import (
+            DecodeMode,
+            HybridModeController,
+        )
+
+        class _Kv:
+            def __init__(self, a):
+                self.kv_allocated_len = a
+
+        class _Req:
+            def __init__(self, rid, alloc, idx):
+                self.rid, self.kv, self.req_pool_idx = rid, _Kv(alloc), idx
+
+            def finished(self):
+                return False
+
+        class _Alloc:
+            def __init__(self, avail):
+                self.size, self._avail = 456000, avail
+
+            def available_size(self):
+                return self._avail
+
+        class _Coord:
+            def __init__(self, avail):
+                self.token_to_kv_pool_allocator = type(
+                    "T", (), {"hisparse_attn_allocator": _Alloc(avail)}
+                )()
+                self.mem_pool_device = type("P", (), {"page_size": 64})()
+                self.spec_ring_capacity = 256
+                self.padded_buffer_size = 8256
+                self.req_device_buffer_size = [0, 0]
+                self.offloaded = []
+                self.reclaimed = 0
+
+            def get_token_stats(self):
+                # High pressure, so the up-threshold is crossed and the switch
+                # is attempted; only the headroom gate can stop it.
+                return type("S", (), {"device_token_usage": 0.9})()
+
+            def offload_running_request(self, req):
+                self.offloaded.append(req.rid)
+
+            def _reclaim_deferred_staging_pages(self):
+                self.reclaimed += 1
+                return False
+
+        def _controller(coord):
+            return HybridModeController(
+                coord,
+                None,
+                usage_threshold_up=0.5,
+                usage_threshold_down=0.25,
+                min_bsz_for_hisparse=2,
+                max_bsz_for_mtp=1,
+                cooldown_steps=0,
+            )
+
+        # Two SHORT requests (1k tokens each, far below the 8256+256 footprint)
+        # and almost no free physical space: the switch must be postponed.
+        short = [_Req("s0", 1000, 0), _Req("s1", 1000, 1)]
+        coord = _Coord(avail=1000)
+        ctl = _controller(coord)
+        self.assertEqual(
+            ctl.on_step(2, short),
+            DecodeMode.MTP,
+            "must postpone the switch when transient headroom is insufficient",
+        )
+        self.assertEqual(coord.offloaded, [], "no partial migration allowed")
+        self.assertGreater(coord.reclaimed, 0, "must try reclaiming first")
+
+        # Same requests with ample headroom: the switch proceeds.
+        coord2 = _Coord(avail=456000)
+        ctl2 = _controller(coord2)
+        self.assertEqual(ctl2.on_step(2, short), DecodeMode.HISPARSE)
+        self.assertEqual(coord2.offloaded, ["s0", "s1"])
 
     # ==================================================================
     # Test: Staging (PD Colocate) path

@@ -2594,6 +2594,45 @@ class ServerArgs:
         ),
         NS("memory"),
     ] = None
+    # HiSparse <-> MTP dynamic switching. When enabled, requests run pure-MTP
+    # (KV device-resident, no swap-in overhead) at light load and migrate into
+    # HiSparse (host offload) as KV-pool pressure rises, then migrate back when
+    # it falls. Implies --enable-hisparse and requires --speculative-algorithm.
+    enable_hisparse_mtp_hybrid: A[
+        bool,
+        "Enable runtime switching between pure MTP and HiSparse+MTP based on KV "
+        "pool utilization. Implies --enable-hisparse and requires a speculative "
+        "algorithm.",
+        NS("memory"),
+    ] = False
+    hisparse_mtp_usage_up: A[
+        float,
+        "KV pool utilization threshold to switch from MTP to HiSparse (default 0.6).",
+        NS("memory"),
+    ] = 0.6
+    hisparse_mtp_usage_down: A[
+        float,
+        "KV pool utilization threshold to switch from HiSparse back to MTP (default 0.3).",
+        NS("memory"),
+    ] = 0.3
+    hisparse_mtp_min_bsz: A[
+        int,
+        "Minimum decode batch size to allow the MTP->HiSparse switch; below this "
+        "the swap-in overhead outweighs the capacity benefit (default 8).",
+        NS("memory"),
+    ] = 8
+    hisparse_mtp_max_bsz_for_mtp: A[
+        int,
+        "Decode batch size at or below which HiSparse always switches back to MTP "
+        "regardless of KV usage, to keep latency low (default 4).",
+        NS("memory"),
+    ] = 4
+    hisparse_mtp_cooldown_steps: A[
+        int,
+        "Number of decode steps to suppress further mode switches after a switch, "
+        "to prevent ping-pong (default 10).",
+        NS("memory"),
+    ] = 10
 
     # -------------------------------------------------------------------------
     # Multi-modal optimization configs
@@ -3324,6 +3363,12 @@ class ServerArgs:
         self._resolved_overrides = []
 
         self._validate_mamba_max_states_per_path()
+
+        # HiSparse<->MTP hybrid implies --enable-hisparse; set it before the
+        # dummy-model short-circuit so the DSA backend resolution and the
+        # hisparse validation passes (which read enable_hisparse) see it.
+        if self.enable_hisparse_mtp_hybrid:
+            self.enable_hisparse = True
 
         if self.model_path.lower() in ["none", "dummy"]:
             return

@@ -82,6 +82,29 @@ class HiSparseCoordinator:
     mtp_enabled = False
     req_device_buffer_logical_locs: Optional[torch.Tensor] = None
     full_to_token_position: Optional[torch.Tensor] = None
+    # Set by the scheduler when --enable-hisparse-mtp-hybrid is on. None means
+    # the request is always offloaded (the non-hybrid HiSparse+MTP behavior).
+    hybrid_controller = None
+
+    def should_admit_new(self) -> bool:
+        """Whether a freshly prefilled request should be offloaded into HiSparse.
+
+        Non-hybrid: always True (every request is offloaded). Hybrid: only when
+        the controller's mode admits offloaded requests; otherwise the request
+        stays device-resident (pure MTP) and is never admitted.
+        """
+        controller = self.hybrid_controller
+        return controller is None or controller.current_mode.admits_offloaded
+
+    def attaches_to_batch(self) -> bool:
+        """Whether the decode/verify batch should run the HiSparse (offloaded) path.
+
+        Non-hybrid: always True. Hybrid: only when the controller's mode runs the
+        offloaded path; otherwise the batch runs the plain resident path (no
+        coordinator attached, attention translates logical->physical directly).
+        """
+        controller = self.hybrid_controller
+        return controller is None or controller.current_mode.attaches_coordinator
 
     def __init__(
         self,
@@ -278,11 +301,20 @@ class HiSparseCoordinator:
             ),
         )
 
-    def admit_request_into_staging(self, req: Req) -> None:
+    def admit_request_into_staging(
+        self, req: Req, num_tokens: Optional[int] = None
+    ) -> None:
+        """Back up a request's device KV to the host pool asynchronously.
+
+        ``num_tokens`` defaults to the prefill length (``req.extend_range.end``).
+        The hybrid mid-decode offload passes the committed length instead, since
+        a running request has generated tokens beyond its prompt.
+        """
         req.hisparse_staging = True
 
+        stage_len = req.extend_range.end if num_tokens is None else num_tokens
         full_kv_indices = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, : req.extend_range.end
+            req.req_pool_idx, :stage_len
         ].to(dtype=torch.int64, copy=True)
         device_indices = (
             self.mem_pool_device.translate_loc_from_full_to_hisparse_device(
@@ -1137,20 +1169,26 @@ class HiSparseMTPCoordinator(HiSparseCoordinator):
 
     # -- Admission / teardown ---------------------------------------------
 
-    def admit_request_into_staging(self, req: Req) -> None:
+    def admit_request_into_staging(
+        self, req: Req, num_tokens: Optional[int] = None
+    ) -> None:
         """Staging admission plus the MTP-only eager setup.
 
         Unlike the plain coordinator (buffer carved at staging ack), the
         request joins the running MTP batch immediately, so the first verify
         may run before the DMA acks: the device buffer, the staging ring, and
         the position inverse map must all be ready at admission time.
+
+        ``num_tokens`` defaults to the prefill length; the hybrid mid-decode
+        offload (:meth:`offload_running_request`) passes the committed length.
         """
         # The base call registers the in-flight transfer before the eager
         # allocation below. If allocation raises, request_finished() can still
         # wait for the DMA and release the host allocation without racing the
         # staging stream.
-        prefill_len = self.host_token_len(req.extend_range.end)
-        super().admit_request_into_staging(req)
+        stage_len = req.extend_range.end if num_tokens is None else num_tokens
+        prefill_len = self.host_token_len(stage_len)
+        super().admit_request_into_staging(req, num_tokens)
         action_index = len(self.ack_staging_queue) - 1
         # The request joins the running batch now and may verify before this
         # DMA acks; stash the event so the first verify waits on it.
@@ -1189,6 +1227,192 @@ class HiSparseMTPCoordinator(HiSparseCoordinator):
                 self.req_device_buffer_token_locs[0, rid, :4].tolist(),
                 self.req_device_buffer_logical_locs[0, rid, :4].tolist(),
             )
+
+    def _wait_for_forward_stream(self) -> None:
+        """Order the current stream after the in-flight forward.
+
+        Migration rewrites the logical->physical mapping and releases physical
+        pages, both of which an overlapped forward may still be reading. Mirrors
+        the ordering request_finished performs before it frees anything.
+        """
+        if self.decode_producer_stream is not None:
+            device_module.current_stream().wait_stream(self.decode_producer_stream)
+
+    def offload_running_request(self, req: Req) -> None:
+        """Migrate a mid-decode device-resident request into HiSparse offload.
+
+        Called by the hybrid controller when the decode mode flips MTP ->
+        HiSparse. A resident request holds a physical slot for every allocated
+        position with a valid logical->physical mapping (the combined-allocator
+        layout), which is structurally the same state a request is in right
+        after prefill -- so admission is reused verbatim, with two adjustments:
+
+        - only the COMMITTED prefix is backed up to host. A running request has
+          generated tokens past its prompt, and the uncommitted look-ahead
+          positions hold stale (rejected-draft) KV that must NOT be staged: the
+          backup high-water mark has to land on the committed length so
+          backup_committed_tokens picks up exactly where this left off.
+        - the look-ahead positions [committed, allocated) keep their logical ids
+          and are rewritten by the next round's draft tokens, but admission's
+          alloc_device_buffer (which spans the full allocated length) just
+          released their resident physical slots and cleared their mapping.
+          Point them at the freshly allocated staging ring, which also anchors
+          the ring window at the migration point.
+
+        Deliberately no partial-page free of the tail: alloc_device_buffer
+        already releases surplus at page granularity while excluding pages
+        shared with the buffer, so the committed prefix's boundary page stays
+        intact.
+        """
+        committed = req.kv_committed_len
+        if committed <= 0:
+            return
+        if int(self.req_device_buffer_size[req.req_pool_idx]) > 0:
+            return  # already offloaded
+
+        allocated = req.kv.kv_allocated_len
+        self._wait_for_forward_stream()
+        self.admit_request_into_staging(req, num_tokens=committed)
+        if allocated > committed:
+            self.assign_spec_ring_slots_batch([req], [committed], [allocated])
+        logger.debug(
+            "HiSparse: offloaded running req %s (committed=%d allocated=%d)",
+            req.rid,
+            committed,
+            allocated,
+        )
+
+    def restore_running_request(self, req: Req) -> bool:
+        """Migrate an offloaded request back to a device-resident layout.
+
+        Called by the hybrid controller when the decode mode flips HiSparse ->
+        MTP. Gives every allocated position a dedicated physical slot so the
+        request runs the plain combined-allocator path again, then tears down
+        the whole HiSparse per-request state.
+
+        Allocation happens BEFORE anything is freed, so a request that cannot
+        fit on device is left completely untouched and the caller can simply
+        keep it offloaded. Returns True when the request is resident.
+        """
+        rid = req.req_pool_idx
+        if int(self.req_device_buffer_size[rid]) <= 0:
+            return True  # already resident
+
+        # The admission staging D2H may still be in flight on
+        # write_staging_stream (offload during cooldown, or a request admitted
+        # at prefill right before the switch back). Restore reads the host KV
+        # that DMA writes and frees the host slots afterwards, so resolve the
+        # request's staging action first -- the same ordering request_finished
+        # enforces. This also releases the action's deferred surplus pages.
+        self._drain_staging_request(req)
+
+        committed = self.host_token_len(req.kv_committed_len)
+        allocated = max(self.host_token_len(req.kv.kv_allocated_len), committed)
+        allocator = self.token_to_kv_pool_allocator.hisparse_attn_allocator
+        page_size = self.mem_pool_device.page_size
+
+        # Allocate first: on failure the request stays exactly as it was.
+        need = ((allocated + page_size - 1) // page_size) * page_size
+        new_slots = allocator.alloc(need)
+        if new_slots is None and self._reclaim_deferred_staging_pages():
+            new_slots = allocator.alloc(need)
+        if new_slots is None:
+            logger.debug(
+                "HiSparse: restore of req %s deferred, %d slots unavailable",
+                req.rid,
+                need,
+            )
+            return False
+        new_slots = new_slots[:allocated].to(torch.int64)
+
+        logical = self.req_to_token_pool.req_to_token[rid, :allocated].to(torch.int64)
+        compressed = self.mem_pool_device.translate_loc_from_full_to_compressed(logical)
+        mapping = self.token_to_kv_pool_allocator.full_to_hisparse_device_index_mapping
+
+        # Make host the single source of truth for the committed prefix. Tokens
+        # in [last_backed, committed) are still only on device (in the buffer or
+        # the ring -- the ring assert guarantees a slot is never recycled before
+        # it has been backed up), so stage them before loading everything back.
+        self._wait_for_forward_stream()
+        self.wait_for_pending_backup()
+        last_backed = min(req.hisparse_last_backed_len or 0, committed)
+        if committed > last_backed:
+            host_tail = self.mem_pool_host.alloc_paged_token_slots(
+                self.req_to_host_pool,
+                self.req_to_host_pool_allocated_len,
+                rid,
+                last_backed,
+                committed - last_backed,
+            )
+            self.mem_pool_host.backup_from_device_all_layer(
+                self.mem_pool_device,
+                host_tail,
+                mapping[compressed[last_backed:committed]].to(torch.int64),
+                io_backend="kernel",
+            )
+            device_module.current_stream().synchronize()
+
+        # Host -> the fresh dedicated slots. The uncommitted look-ahead tail
+        # holds rejected-draft KV that the next round overwrites, so it needs
+        # slots but no data.
+        if committed > 0:
+            host_indices = self.req_to_host_pool[rid, :committed]
+            for layer_id in range(self.mem_pool_device.layer_num):
+                self.mem_pool_host.load_to_device_per_layer(
+                    self.mem_pool_device,
+                    host_indices,
+                    new_slots[:committed],
+                    layer_id,
+                    io_backend="kernel",
+                )
+            device_module.current_stream().synchronize()
+
+        # Repoint every position at its dedicated slot, then release the
+        # HiSparse physical regions. Page-granular free (mirroring
+        # request_finished) because the buffer carve is not page-aligned; the
+        # freshly allocated slots sit on disjoint pages, so they are unaffected.
+        mapping[compressed] = new_slots
+        physical_locs = []
+        buf_cap = int(self.req_device_buffer_size[rid])
+        if buf_cap > 0:
+            buf = self.req_to_device_buffer[rid, :buf_cap]
+            buf = buf[buf > 0]
+            if buf.numel() > 0:
+                physical_locs.append(buf)
+        ring = self._free_spec_ring(req)
+        if ring is not None and ring.numel() > 0:
+            physical_locs.append(ring)
+        if physical_locs:
+            all_hi = torch.cat(physical_locs)
+            pages = torch.unique(all_hi // page_size)
+            self.token_to_kv_pool_allocator.free_hisparse_indices(pages * page_size)
+
+        host_allocated = self.mem_pool_host.allocated_host_indices(
+            self.req_to_host_pool, rid, self.req_to_host_pool_allocated_len[rid]
+        )
+        if host_allocated.numel() > 0:
+            self.mem_pool_host.free(host_allocated)
+
+        self._clear_buffer_identities(rid)
+        self._clear_token_positions(compressed)
+        self.req_device_buffer_token_locs[:, rid, :] = -1
+        self.req_to_device_buffer[rid, :] = 0
+        self.req_device_buffer_size[rid] = 0
+        self.req_to_host_pool[rid, :] = -1
+        self.req_to_host_pool_allocated_len[rid] = 0
+        self.lru_slots[:, rid, :].copy_(self._lru_init)
+        self._skip_first_backup[rid] = False
+        self._pending_first_verify_event.pop(rid, None)
+        req.hisparse_last_backed_len = None
+        req.hisparse_ring_start = None
+        req.hisparse_staging = False
+        logger.debug(
+            "HiSparse: restored req %s to resident (committed=%d allocated=%d)",
+            req.rid,
+            committed,
+            allocated,
+        )
+        return True
 
     def admit_request_direct(self, req: Req) -> None:
         """Direct-to-host path: KV data already resides in host pool via RDMA.

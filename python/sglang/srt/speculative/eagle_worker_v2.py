@@ -1165,7 +1165,11 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 hisparse_coord = (
                     self.target_worker.model_runner.hisparse_coordinator
                 )
-                if hisparse_coord is not None:
+                # Hybrid: in the resident (pure-MTP) mode do NOT offload freshly
+                # prefilled requests -- their KV stays device-resident and the
+                # decode batch runs the plain path. should_admit_new() is always
+                # True for non-hybrid HiSparse+MTP.
+                if hisparse_coord is not None and hisparse_coord.should_admit_new():
                     for req in batch.reqs:
                         if (
                             not req.finished()

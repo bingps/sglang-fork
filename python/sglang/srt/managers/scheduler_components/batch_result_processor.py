@@ -251,6 +251,7 @@ class SchedulerBatchResultProcessor:
                         maybe_cache_unfinished_req(req, self.tree_cache)
                         if (
                             self.server_args.enable_hisparse
+                            and self.hisparse_coordinator.should_admit_new()
                             and self.hisparse_coordinator.req_device_buffer_size[
                                 req.req_pool_idx
                             ]

@@ -459,6 +459,7 @@ class TestHiSparseSpeculativeGuards(unittest.TestCase):
         hf = SimpleNamespace(architectures=["DeepseekV32ForCausalLM"])
         server_args = SimpleNamespace(
             enable_hisparse=True,
+            enable_hisparse_mtp_hybrid=False,
             disable_radix_cache=True,
             disaggregation_decode_enable_offload_kvcache=True,
             speculative_algorithm=None,

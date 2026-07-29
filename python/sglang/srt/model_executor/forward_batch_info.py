@@ -1487,6 +1487,20 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         tokens_padded = (tokens + rank_size - 1) // rank_size * rank_size
         self._pad_inputs_to_size(model_runner, tokens_padded, self.batch_size)
 
+    @property
+    def real_batch_size(self) -> int:
+        """Batch size excluding DP-sync padding rows.
+
+        ``prepare_mlp_sync_batch`` rewrites ``batch_size`` to the DP-padded
+        size (stashing the original in ``_original_batch_size``), so anything
+        that must count only this rank's genuine requests -- e.g. the HiSparse
+        swap-in kernel's ``num_real_reqs`` guard, which filters dummy blocks --
+        has to read this instead of ``batch_size``.
+        """
+        if self._original_batch_size is not None:
+            return self._original_batch_size
+        return self.batch_size
+
     def post_forward_mlp_sync_batch(self, logits_output: LogitsProcessorOutput):
         if self._original_forward_mode is not None:
             self.forward_mode = self._original_forward_mode

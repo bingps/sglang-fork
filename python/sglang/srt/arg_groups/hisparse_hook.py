@@ -215,6 +215,36 @@ def validate_hisparse(server_args: ServerArgs) -> None:
         server_args.disable_radix_cache
     ), "Hierarchical sparse attention currently requires --disable-radix-cache."
 
+    # HiSparse<->MTP hybrid switching runs both a pure-MTP (device-resident)
+    # and a HiSparse+MTP (host-offload) decode path and migrates requests
+    # between them, so it requires a speculative algorithm. The MTP-specific
+    # hisparse constraints below (EAGLE/EAGLE3, linear chain, no PD, verify
+    # swap-in backend) all apply and are enforced by
+    # _validate_hisparse_speculative_algorithm.
+    if server_args.enable_hisparse_mtp_hybrid and server_args.speculative_algorithm is None:
+        raise ValueError(
+            "--enable-hisparse-mtp-hybrid requires a speculative algorithm "
+            "(--speculative-algorithm EAGLE/EAGLE3): the hybrid switches between "
+            "pure MTP and HiSparse+MTP decode. Set --speculative-algorithm or "
+            "drop --enable-hisparse-mtp-hybrid."
+        )
+
+    # Under DP attention each rank owns an independent device pool, so the
+    # per-rank pressure signal differs and the mode decision can diverge. A
+    # rank that offloads while its peers stay resident runs a different number
+    # of forwards / token counts, which deadlocks the per-step MLP-sync
+    # collective. Cross-rank agreement (piggybacking the decision on the
+    # existing MLPSyncBatchInfo all-gather) is not implemented yet, so reject
+    # the combination rather than hang mid-run.
+    if server_args.enable_hisparse_mtp_hybrid and server_args.enable_dp_attention:
+        raise ValueError(
+            "--enable-hisparse-mtp-hybrid is not supported with "
+            "--enable-dp-attention yet: the mode decision is per-rank, and "
+            "diverging decisions deadlock the MLP-sync collective. Run the "
+            "hybrid with pure TP, or drop --enable-hisparse-mtp-hybrid to use "
+            "static HiSparse+MTP under DP."
+        )
+
     # Decode-side KV offload hands req_to_token LOGICAL ids straight to the plain
     # KV backup without the HiSparse logical->physical translation, and its async
     # completion bypasses hisparse_coordinator.request_finished (leaking the

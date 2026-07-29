@@ -778,6 +778,11 @@ class Envs:
     # than the graph saves (e.g. DeepEP MoE workspace captured at full dispatch
     # capacity).
     SGLANG_DISABLE_DRAFT_EXTEND_CUDA_GRAPH = EnvBool(False)
+    # Debug pin for the HiSparse<->MTP hybrid mode controller: "mtp" keeps every
+    # request device-resident (pure MTP on a HiSparse boot), "hisparse" keeps
+    # the always-offloaded behavior. Unset leaves the controller in charge.
+    # Used to measure each path in isolation (A/B, profiling).
+    SGLANG_FORCE_HISPARSE_MTP_MODE = EnvStr(None)
     # Use the split-KV (flash-decode) kernel for EAGLE target-verify on the
     # Triton backend (ROCm). Only active at speculative topk == 1; falls back to
     # extend_attention_fwd for unsupported cases or when set false (e.g. for

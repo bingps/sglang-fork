@@ -1846,6 +1846,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     # HiSparse (engine-level coordinator ref, same across batches)
     hisparse_coordinator: Optional[HiSparseCoordinator] = None
+    # HiSparse<->MTP hybrid: True when this batch runs the pure-MTP resident
+    # path (no coordinator attached; attention translates logical->physical
+    # directly). Set by the scheduler each step from the hybrid controller's
+    # mode; distinguishes a legitimately resident batch (no coordinator by
+    # design) from the bug of a dropped coordinator attribute.
+    hisparse_resident: bool = False
 
     # === Batch-variant scheduler state (per-batch; not read by ForwardBatch) ===
     # Tell whether the current running batch is full so that we can skip
@@ -2624,6 +2630,25 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         whether the next decode step fits in the KV pool."""
         num_tokens = self.new_tokens_required_next_decode(selected_indices)
         evict_from_tree_cache(self.tree_cache, num_tokens)
+        if not self.spec_algorithm.is_none() and self.hisparse_coordinator is not None:
+            # Offloaded MTP: eagle_prepare_for_decode reserves the next spec
+            # slots under spec_logical_alloc() -- LOGICAL ids only, physical
+            # locations come from each request's fixed staging ring. Gating on
+            # available_size() = min(logical, physical) would report OOM once
+            # the fixed buffer+ring footprints fill the physical pool (which
+            # they do by design at the concurrency cap) and retract requests
+            # whose allocation would in fact succeed.
+            return (
+                self.token_to_kv_pool_allocator.logical_available_size()
+                >= num_tokens
+            )
+        # HiSparse non-MTP still needs this check: radix cache is forced off
+        # (eviction above is a no-op), but admission is optimistic (prefill
+        # reserves only the prompt, not max_new_tokens), so concurrent decode
+        # growth can exhaust the logical pool mid-stream and retract_decode is
+        # the only recovery path. min(logical, physical) is safe here because
+        # the non-spec branch needs tokens only at page boundaries and a false
+        # negative merely causes a recoverable retraction.
         return self.token_to_kv_pool_allocator.available_size() >= num_tokens
 
     def retract_decode(

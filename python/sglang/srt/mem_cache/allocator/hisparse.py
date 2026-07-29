@@ -84,6 +84,17 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self.hisparse_attn_allocator.available_size(),
         )
 
+    def logical_available_size(self) -> int:
+        """Capacity for allocations that consume LOGICAL ids only.
+
+        The offloaded MTP decode path reserves its speculative slots under
+        spec_logical_alloc() -- physical locations come from each request's
+        fixed staging ring, not this pool -- so its admission check must not
+        be capped by the physical side: the fixed buffer+ring footprints fill
+        the physical pool by design at the concurrency cap.
+        """
+        return self.logical_attn_allocator.available_size()
+
     def get_kvcache(self):
         return self._kvcache
 
