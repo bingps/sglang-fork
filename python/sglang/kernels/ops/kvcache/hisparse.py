@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import functools
+import os
 from typing import TYPE_CHECKING
 
 import torch
@@ -219,12 +220,14 @@ def _jit_sparse_mtp_module(
     hot_buffer_size: int,
     is_mla: bool = False,
     is_dsv4_layout: bool = False,
+    probe_only: bool = False,
 ) -> "Module":
     template_args = make_cpp_args(
         block_size, num_top_k, hot_buffer_size, is_mla, is_dsv4_layout
     )
+    variant = ("probeonly",) if probe_only else ()
     cache_args = make_cpp_args(
-        item_size_bytes, block_size, num_top_k, hot_buffer_size, is_mla, is_dsv4_layout, "mtp"
+        item_size_bytes, block_size, num_top_k, hot_buffer_size, is_mla, is_dsv4_layout, "mtp", *variant
     )
     return load_jit(
         "sparse_cache_mtp",
@@ -236,6 +239,7 @@ def _jit_sparse_mtp_module(
                 f"load_cache_to_device_buffer_mtp<{template_args}>",
             )
         ],
+        extra_cuda_cflags=(["-DHISPARSE_PROBE_ONLY"] if probe_only else None),
     )
 
 
@@ -314,6 +318,7 @@ def load_cache_to_device_buffer_mtp_mla(
         hot_buffer_size,
         is_mla=True,
         is_dsv4_layout=False,
+        probe_only=bool(int(os.environ.get("HISPARSE_PROBE_ONLY", "0") or "0")),
     )
 
     empty = torch.empty(0)

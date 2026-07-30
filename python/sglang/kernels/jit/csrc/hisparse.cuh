@@ -845,6 +845,7 @@ __global__ void load_cache_to_device_buffer_mtp_kernel(
       }
       const int64_t src_loc = req_host_cache_locs[raw_pos];
       const int64_t dst_loc = static_cast<int64_t>(req_device_buffer_locs[evict_slot]);
+#if !defined(HISPARSE_PROBE_ONLY)
       if constexpr (IsDsv4Layout) {
         device::hisparse::transfer_item(device_buffer_k, const_cast<void*>(host_cache_k),
             static_cast<int32_t>(dst_loc), static_cast<int32_t>(src_loc));
@@ -858,6 +859,10 @@ __global__ void load_cache_to_device_buffer_mtp_kernel(
           transfer_item_warp(lane_id, src_v, dst_v, item_size_bytes);
         }
       }
+#else
+      // HISPARSE_PROBE_ONLY: keep loop iteration & scheduling, skip byte copy.
+      (void)src_loc; (void)dst_loc;
+#endif
     }
     __syncthreads();  // ensure DMA completes before next position reads buffer
   }  // end for pos
