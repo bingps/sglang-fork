@@ -39,6 +39,12 @@ class TestHiSparsePoolConfigurator(CustomTestCase):
                 hisparse_config=(f'{{"host_to_device_ratio": {host_to_device_ratio}}}'),
                 dsa_prefill_backend="flashmla_sparse",
                 dsa_decode_backend="flashmla_sparse",
+                # The indexer expansion ratio depends on which logical KV pool
+                # backs HiSparse; these three resolve it to private-host, whose
+                # expansion is host_to_device_ratio.
+                disable_radix_cache=True,
+                enable_hierarchical_cache=False,
+                hicache_write_policy="write_through",
             ),
         )
 

@@ -79,6 +79,7 @@ from sglang.srt.mem_cache.utils import (
 )
 
 if TYPE_CHECKING:
+    from sglang.srt.managers.hisparse_protocol import HiSparseEvictionHooks
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 
@@ -420,6 +421,10 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         self.enable_kv_cache_events = params.enable_kv_cache_events
         self.kv_event_queue = []
 
+        # Set only by HiSparse's HiCache backing, which lets the tree evict the
+        # KV of a still-decoding request; see `HiSparseEvictionHooks`.
+        self.hisparse_eviction_hooks: Optional[HiSparseEvictionHooks] = None
+
         self.reset()
 
     # ==== Tree API ====
@@ -483,6 +488,29 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             last_host_node=self.root_node.id,
             best_match_node=self.root_node.id,
             cache_actions=[],
+        )
+
+    def set_hisparse_eviction_hooks(
+        self, hooks: Optional[HiSparseEvictionHooks]
+    ) -> None:
+        """Let HiSparse follow this tree's device evictions; see
+        `HiSparseEvictionHooks` for what the two callbacks owe each other."""
+        self.hisparse_eviction_hooks = hooks
+
+    def _notify_hisparse_device_released(self, node: UnifiedTreeNode) -> None:
+        """Called wherever a node's device KV is about to be freed, and only
+        there: HiSparse reads the node's device and host index arrays, so firing
+        this after the release would hand it an empty node, and firing it twice
+        would double-count the eviction against a request."""
+        if self.hisparse_eviction_hooks is not None:
+            self.hisparse_eviction_hooks.on_device_released(node)
+
+    def _hisparse_backs_live_request(self, node: UnifiedTreeNode) -> bool:
+        """Whether dropping this node's KV without a host copy would strand a
+        live HiSparse request."""
+        return (
+            self.hisparse_eviction_hooks is not None
+            and self.hisparse_eviction_hooks.backs_live_request(node)
         )
 
     def node_by_id(self, node_id: NodeId) -> UnifiedTreeNode:
@@ -1261,6 +1289,12 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         assert not node.backuped and node.write_through_pending_id is None
         if any(cd.host_lock_ref > 0 for cd in node.component_data):
             return result
+        if self._hisparse_backs_live_request(node):
+            # Dropping this KV is unrecoverable for a HiSparse request decoding
+            # against it: the position would have no home in either tier and
+            # attention would silently mask it. Declining keeps the node on
+            # device, which the caller reports and resolves by retraction.
+            return result
         descendants: list[UnifiedTreeNode] = []
         stack = list(node.children.values())
         while stack:
@@ -1324,6 +1358,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         host_frees: dict[ComponentType, list[torch.Tensor]],
     ) -> None:
         """Delete a device leaf that has no host backup, freeing all layers."""
+        self._notify_hisparse_device_released(node)
         self._release_all_component_layers(
             node, StorageMedium.GPU, tracker, device_frees, host_frees
         )
@@ -1482,6 +1517,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         host_frees: dict[ComponentType, list[torch.Tensor]],
     ) -> None:
         assert not node.evicted and node.backuped
+        self._notify_hisparse_device_released(node)
         trigger = self.components_by_type[BASE_COMPONENT_TYPE]
         self._evict_component_and_detach_lru(
             node,
